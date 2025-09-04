@@ -4,12 +4,9 @@ from discord import app_commands
 import datetime
 
 # ------------------- CONFIG -------------------
-TOKEN = "YOUR_BOT_TOKEN"  # Replace with your bot token
-GUILD_ID = 123456789012345678  # Replace with your server ID
-OWNER_ID = 123456789012345678  # Your Discord ID for full access
-LOG_CHANNEL_ID = 123456789012345678  # Logs channel
-WHITELISTED_ROLES = [111111111111111111]  # Role IDs allowed to manage
-WHITELISTED_MEMBERS = [OWNER_ID]  # Members allowed to manage
+import os
+TOKEN = os.environ.get("TOKEN")  # or TOKEN = "YOUR_BOT_TOKEN"
+
 # ----------------------------------------------
 
 intents = discord.Intents.default()
@@ -186,3 +183,4 @@ async def role_toggle_antimod(interaction: discord.Interaction, role: discord.Ro
 
 # ------------------- RUN -------------------
 bot.run(TOKEN)
+
