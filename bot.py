@@ -3,6 +3,8 @@ from discord.ext import commands
 from discord import app_commands, utils
 import datetime
 import os
+import asyncio
+from aiohttp import web
 
 # ------------------- CONFIG -------------------
 TOKEN = os.environ.get("TOKEN")
@@ -164,11 +166,87 @@ async def on_ready():
     except Exception as e:
         print("Error syncing slash commands:", e)
 
-# Anti-Nuke and Anti-Mod Events
+@bot.event
+async def on_member_join(member):
+    # Emojis from the provided screenshot
+    catty_emoji = "<:catty:1413454910372184086>"
+    tick_emoji = "<:tick:1413454800141418626>"
+    
+    role_id = 1412416423652757556
+    guild = member.guild
+    role_to_assign = discord.utils.get(guild.roles, id=role_id)
+
+    if role_to_assign:
+        try:
+            await member.add_roles(role_to_assign)
+            await log_event(
+                guild.name,
+                guild.icon.url if guild.icon else None,
+                "New Member Joined",
+                f"Assigned role {role_to_assign.mention} to new member {member.mention} ({member.id}).",
+                discord.Color.blue()
+            )
+
+            # Send a welcome message to the user's DMs
+            welcome_embed = discord.Embed(
+                title=f"Welcome to {guild.name}!",
+                description=f"Hey there, {member.mention}! {catty_emoji} We're thrilled to have you here.\n\n"
+                            f"Here's what I've done for you:\n"
+                            f"{tick_emoji} Assigned you the role: **{role_to_assign.name}**\n"
+                            f"{tick_emoji} Made sure you're safe by enabling our Anti-Nuke system.",
+                color=discord.Color.from_rgb(0, 150, 255),
+                timestamp=datetime.datetime.now()
+            )
+            welcome_embed.set_thumbnail(url=member.display_avatar.url)
+            welcome_embed.set_footer(text=f"Bot | Server: {guild.name}", icon_url=guild.icon.url if guild.icon else None)
+
+            try:
+                await member.send(embed=welcome_embed)
+                await log_event(
+                    guild.name,
+                    guild.icon.url if guild.icon else None,
+                    "Welcome Message Sent",
+                    f"Welcome message sent to {member.mention} via DM.",
+                    discord.Color.green()
+                )
+            except discord.Forbidden:
+                await log_event(
+                    guild.name,
+                    guild.icon.url if guild.icon else None,
+                    "Welcome Message Failed",
+                    f"Failed to send welcome message to {member.mention} because their DMs are closed.",
+                    discord.Color.orange()
+                )
+
+        except discord.Forbidden:
+            await log_event(
+                guild.name,
+                guild.icon.url if guild.icon else None,
+                "Role Assignment Failed",
+                f"Failed to assign role {role_to_assign.mention} to {member.mention} due to insufficient permissions.",
+                discord.Color.orange()
+            )
+        except Exception as e:
+            await log_event(
+                guild.name,
+                guild.icon.url if guild.icon else None,
+                "Role Assignment Error",
+                f"An unexpected error occurred while assigning a role to {member.mention}: {e}",
+                discord.Color.red()
+            )
+    else:
+        await log_event(
+            guild.name,
+            guild.icon.url if guild.icon else None,
+            "Role Not Found",
+            f"Could not find role with ID `{role_id}`. Please check if the role exists.",
+            discord.Color.red()
+        )
+
 @bot.event
 async def on_audit_log_entry_create(entry):
     executor = entry.user
-    if executor == bot.user: # Ignore bot's own actions
+    if executor == bot.user:
         return
     if is_whitelisted(executor) or role_allows(executor, "antinuke") or role_allows(executor, "antimod"):
         return
@@ -200,7 +278,6 @@ async def on_audit_log_entry_create(entry):
         await log_event(guild.name, guild.icon.url if guild.icon else None, log_title, description, discord.Color.red())
         await punish_executor(executor)
 
-        # Attempt to revert specific actions
         if entry.action == discord.AuditLogAction.webhook_create and entry.target:
             try:
                 await entry.target.delete()
@@ -221,14 +298,10 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
             description = f"Executor: {executor.mention} ({executor.id})\nTarget: {user.mention} ({user.id})"
             await log_event(guild.name, guild.icon.url if guild.icon else None, "Unauthorized Ban", description, discord.Color.red())
             await punish_executor(executor)
-            # Optionally, unban the user here if desired
-            # await guild.unban(user)
-            # await log_event("Unbanned User", f"Unbanned {user.mention} after unauthorized ban.", discord.Color.green())
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     guild = member.guild
-    # Check for kick
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.kick):
         executor = entry.user
         if executor == bot.user:
@@ -239,7 +312,6 @@ async def on_member_remove(member: discord.Member):
                 await log_event(guild.name, guild.icon.url if guild.icon else None, "Unauthorized Kick", description, discord.Color.red())
                 await punish_executor(executor)
     
-    # Log general member leaving, not necessarily a kick
     await log_event(guild.name, guild.icon.url if guild.icon else None, "Member Left", f"Member: {member.mention} ({member.id})", discord.Color.light_grey())
 
 
@@ -294,10 +366,8 @@ async def on_guild_role_update(before: discord.Role, after: discord.Role):
                 f"Before: {before.name} (ID: {before.id})\n"
                 f"After: {after.name} (ID: {after.id})"
             )
-            # You might add more details here about what specific changes were made
             await log_event(guild.name, guild.icon.url if guild.icon else None, "Unauthorized Role Update", description, discord.Color.red())
             await punish_executor(executor)
-            # Revert the role update if possible (e.g., reset permissions, name)
             try:
                 await after.edit(
                     name=before.name,
@@ -310,7 +380,6 @@ async def on_guild_role_update(before: discord.Role, after: discord.Role):
                 await log_event(guild.name, guild.icon.url if guild.icon else None, "Role Reverted", f"Reverted unauthorized update to role {after.mention}.", discord.Color.green())
             except discord.Forbidden:
                 await log_event(guild.name, guild.icon.url if guild.icon else None, "Role Revert Failed", f"Could not revert unauthorized update to role {after.mention} due to permissions.", discord.Color.orange())
-
 
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
@@ -364,10 +433,8 @@ async def on_guild_channel_update(before: discord.abc.GuildChannel, after: disco
                 f"Before: #{before.name} (ID: {before.id})\n"
                 f"After: #{after.name} (ID: {after.id})"
             )
-            # You might add more details here about what specific changes were made
             await log_event(guild.name, guild.icon.url if guild.icon else None, "Unauthorized Channel Update", description, discord.Color.red())
             await punish_executor(executor)
-            # Revert the channel update if possible (e.g., reset name, permissions)
             try:
                 await after.edit(
                     name=before.name,
@@ -483,7 +550,6 @@ async def check_whitelist(interaction: discord.Interaction, target: discord.Memb
         embed.color = discord.Color.red()
     embed.set_footer(text=f"Bot | Server: {interaction.guild.name}", icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
     await interaction.response.send_message(embed=embed)
-
 
 # Global toggles
 @bot.tree.command(name="toggle_antinuke", description="Enable/Disable AntiNuke globally")
@@ -625,5 +691,29 @@ async def role_toggle_antimod(interaction: discord.Interaction, role: discord.Ro
     embed.set_footer(text=f"Bot | Server: {interaction.guild.name}", icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
     await interaction.response.send_message(embed=embed)
 
+
+# ------------------- WEB SERVER -------------------
+async def web_server_handler(request):
+    """Simple web server to respond to uptime pings."""
+    return web.Response(text="Bot is awake!")
+
+async def start_web_server():
+    """Starts the aiohttp web server."""
+    app = web.Application()
+    app.router.add_get("/", web_server_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8080)))
+    await site.start()
+    print("Web server started.")
+
 # ------------------- RUN -------------------
-bot.run(TOKEN)
+async def main():
+    """Runs both the bot and the web server concurrently."""
+    await asyncio.gather(
+        start_web_server(),
+        bot.start(TOKEN)
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
