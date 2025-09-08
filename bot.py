@@ -17,7 +17,6 @@ intents.integrations = True
 intents.webhooks = True
 intents.guild_messages = True
 intents.guild_reactions = True
-intents.guild_members = True
 intents.bans = True
 intents.guild_messages = True
 intents.guild_messages = True
