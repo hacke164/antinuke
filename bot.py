@@ -303,14 +303,22 @@ def create_automod_embed(config, guild, targetor=None):
         app_commands.Choice(name="Anti-Nuke", value="anti_nuke"),
         app_commands.Choice(name="Auto-Mod", value="auto_mod")
     ],
+    # Fix: Changed boolean values to strings, as choices only support string, int, or float.
     state=[
-        app_commands.Choice(name="Enable (True)", value=True),
-        app_commands.Choice(name="Disable (False)", value=False)
+        app_commands.Choice(name="Enable (True)", value="true"),
+        app_commands.Choice(name="Disable (False)", value="false")
     ]
 )
 @app_commands.default_permissions(administrator=True)
-async def set_permissions(interaction: Interaction, target: Union[discord.Member, discord.Role], module: str, feature: str, state: bool):
-    """Dynamically populates the feature choices based on the selected module."""
+async def set_permissions(interaction: Interaction, target: Union[discord.Member, discord.Role], module: str, feature: str, state: str):
+    """
+    Sets a whitelisted permission for a member or role.
+    Note: The 'state' parameter is a string due to Discord API limitations
+    and is converted to a boolean inside the function.
+    """
+    # Convert the string state to a boolean
+    boolean_state = state == "true"
+
     if module == "anti_nuke":
         features = list(bot.config["anti_nuke"].keys())
     elif module == "auto_mod":
@@ -329,10 +337,10 @@ async def set_permissions(interaction: Interaction, target: Union[discord.Member
     if target_id not in permissions:
         permissions[target_id] = {"anti_nuke": {}, "auto_mod": {}}
     
-    permissions[target_id][module][feature] = state
+    permissions[target_id][module][feature] = boolean_state
     save_config(bot.config)
 
-    action = "enabled" if state else "disabled"
+    action = "enabled" if boolean_state else "disabled"
     embed = Embed(
         title="Permissions Updated",
         description=f"Permissions for {target.mention} have been updated.",
