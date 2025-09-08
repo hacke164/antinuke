@@ -171,10 +171,6 @@ class AntiNukeView(ui.View):
 @app_commands.default_permissions(administrator=True)
 async def antinuke(interaction: Interaction):
     """Sends an embed with buttons to manage Anti-Nuke features."""
-    if interaction.guild and interaction.guild.name != "EvX Corp":
-        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
-        return
-
     embed = create_antinuke_embed(bot.config["anti_nuke"], interaction.guild, interaction.user)
     view = AntiNukeView(bot)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -252,10 +248,6 @@ class AutoModView(ui.View):
 @app_commands.default_permissions(administrator=True)
 async def automod(interaction: Interaction):
     """Sends an embed with buttons to manage Auto-Mod features."""
-    if interaction.guild and interaction.guild.name != "EvX Corp":
-        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
-        return
-
     embed = create_automod_embed(bot.config["auto_mod"], interaction.guild, interaction.user)
     view = AutoModView(bot)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -293,10 +285,6 @@ def create_automod_embed(config, guild, targetor=None):
 @app_commands.default_permissions(administrator=True)
 async def whitelist(interaction: Interaction, member: discord.Member, action: str):
     """Adds or removes a member from the bot's whitelist."""
-    if interaction.guild and interaction.guild.name != "EvX Corp":
-        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
-        return
-
     whitelisted_ids = bot.config["whitelisted_ids"]
     user_id = str(member.id)
 
@@ -328,10 +316,6 @@ async def whitelist(interaction: Interaction, member: discord.Member, action: st
 @app_commands.default_permissions(administrator=True)
 async def create_embed(interaction: Interaction, title: str, description: str, color: int = 0x3498db, url: str = None, image_url: str = None, thumbnail_url: str = None):
     """Creates a custom embed with provided details."""
-    if interaction.guild and interaction.guild.name != "EvX Corp":
-        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
-        return
-
     try:
         embed = Embed(
             title=title,
@@ -408,10 +392,6 @@ class TicketButton(ui.View):
 @app_commands.default_permissions(administrator=True)
 async def ticket_panel(interaction: Interaction):
     """Sends a ticket panel with a button to create tickets."""
-    if interaction.guild and interaction.guild.name != "EvX Corp":
-        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
-        return
-
     ticket_embed = Embed(
         title=f"{interaction.guild.name}™ Ticket System",
         description="Need help? Click the button below to create a private support ticket.",
