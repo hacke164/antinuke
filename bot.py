@@ -4,6 +4,9 @@ import os
 import json
 from discord import app_commands, Embed, Interaction, ButtonStyle, ui, Permissions
 from discord.ui import Button, View
+import http.server
+import socketserver
+import threading
 
 # --- Configuration and Data Persistence ---
 CONFIG_FILE = 'config.json'
@@ -85,34 +88,38 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Handles new members joining the server."""
+    """Handles new members joining the server and assigns a specific role."""
     guild = member.guild
 
-    # Assign the lowest role (just above @everyone)
-    roles = sorted(guild.roles, key=lambda r: r.position)
-    lowest_role = None
-    for role in roles:
-        if role.name != '@everyone':
-            lowest_role = role
-            break
-    if lowest_role:
+    # Assign a specific role to new members
+    # The role ID is hardcoded as requested by the user.
+    role_id_to_assign = 1412416423652757556
+    role_to_assign = guild.get_role(role_id_to_assign)
+
+    if role_to_assign:
         try:
-            await member.add_roles(lowest_role, reason="Automatically assigned lowest role on join.")
-            print(f"Assigned lowest role '{lowest_role.name}' to {member.name}")
+            await member.add_roles(role_to_assign, reason="Automatically assigned new member role.")
+            print(f"Assigned role '{role_to_assign.name}' to {member.name}")
         except discord.Forbidden:
             print(f"Failed to assign role to {member.name}: Bot lacks permissions.")
+        except Exception as e:
+            print(f"An error occurred while assigning role: {e}")
+    else:
+        print(f"Role with ID {role_id_to_assign} not found in guild.")
 
-    # Send a welcome message in a specific channel
-    channel = discord.utils.get(guild.channels, name="welcome")
-    if channel and isinstance(channel, discord.TextChannel):
-        welcome_embed = Embed(
-            title=f"Welcome to {guild.name}!",
-            description=f"Welcome {member.mention} to the server! Please make sure to read the rules.",
-            color=0x4a90e2
-        )
-        welcome_embed.set_thumbnail(url=member.display_avatar.url)
-        welcome_embed.set_footer(text=f"Member count: {guild.member_count}")
-        await channel.send(f"{EMOJI_IDS['welcome']} {member.mention}", embed=welcome_embed)
+    # Send a welcome message as a DM to the new member
+    welcome_embed = Embed(
+        title=f"Welcome to {guild.name}!",
+        description=f"Welcome {member.mention} to the server! Please make sure to read the rules.",
+        color=0x4a90e2
+    )
+    welcome_embed.set_thumbnail(url=member.display_avatar.url)
+    welcome_embed.set_footer(text=f"Member count: {guild.member_count}")
+    try:
+        await member.send(f"{EMOJI_IDS['welcome']} {member.mention}", embed=welcome_embed)
+        print(f"Sent welcome DM to {member.name}")
+    except discord.Forbidden:
+        print(f"Failed to send welcome DM to {member.name}: User has DMs disabled.")
 
 # --- Antinuke Module Commands and Logic ---
 class AntiNukeView(ui.View):
@@ -415,5 +422,28 @@ async def ticket_panel(interaction: Interaction):
     view = TicketButton(bot)
     await interaction.response.send_message(embed=ticket_embed, view=view)
 
-# --- Start the bot ---
-bot.run(TOKEN)
+# --- Web Server for Render Deployment ---
+class Handler(http.server.BaseHTTPRequestHandler):
+    """Simple HTTP request handler."""
+    def do_GET(self):
+        """Responds to GET requests."""
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(bytes("<h1>Bot is running!</h1>", "utf-8"))
+
+def run_web_server():
+    """Runs a simple web server to satisfy Render's port check."""
+    PORT = int(os.environ.get("PORT", 8080))
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        print(f"Serving at port {PORT}")
+        httpd.serve_forever()
+
+# --- Start the bot and web server ---
+if __name__ == "__main__":
+    # Start the web server in a separate thread
+    web_server_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_server_thread.start()
+
+    # Start the bot
+    bot.run(TOKEN)
