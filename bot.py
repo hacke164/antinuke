@@ -7,6 +7,7 @@ from discord.ui import Button, View
 import http.server
 import socketserver
 import threading
+from typing import Union
 
 # --- Configuration and Data Persistence ---
 CONFIG_FILE = 'config.json'
@@ -39,7 +40,8 @@ def load_config():
                 "file_blocking": True,
                 "fast_message_typing": True
             },
-            "whitelisted_ids": []
+            # New, more powerful permission structure
+            "whitelisted_permissions": {}
         }
     with open(CONFIG_FILE, 'r') as f:
         return json.load(f)
@@ -58,13 +60,14 @@ if not TOKEN:
 
 # Define bot intents to get the necessary permissions
 intents = discord.Intents.default()
-intents.members = True  # Required for on_member_join
-intents.message_content = True  # Required for message content monitoring
-intents.guilds = True  # Required for guild and role info
+intents.members = True
+intents.message_content = True
+intents.guilds = True
 
 # Initialize the bot with intents
 bot = commands.Bot(command_prefix='!', intents=intents)
 bot.config = load_config()
+bot.bad_words = ["fuck", "shit", "asshole", "bitch"] # A simple list of words to demonstrate
 
 # Define the animated emoji IDs
 EMOJI_IDS = {
@@ -72,6 +75,17 @@ EMOJI_IDS = {
     "tick": "<a:tick:1414542503721570345>",
     "welcome": "<a:welcome:1414542454056685631>"
 }
+
+# --- Utility Functions ---
+def is_whitelisted_for_feature(member_or_role: Union[discord.Member, discord.Role], module: str, feature: str):
+    """Checks if a member or role is whitelisted for a specific feature."""
+    permissions = bot.config["whitelisted_permissions"]
+    target_id = str(member_or_role.id)
+
+    if target_id in permissions:
+        if module in permissions[target_id] and feature in permissions[target_id][module]:
+            return permissions[target_id][module][feature]
+    return False # Default to not whitelisted
 
 # --- Bot Events ---
 @bot.event
@@ -90,12 +104,8 @@ async def on_ready():
 async def on_member_join(member: discord.Member):
     """Handles new members joining the server and assigns a specific role."""
     guild = member.guild
-
-    # Assign a specific role to new members
-    # The role ID is hardcoded as requested by the user.
     role_id_to_assign = 1412416423652757556
     role_to_assign = guild.get_role(role_id_to_assign)
-
     if role_to_assign:
         try:
             await member.add_roles(role_to_assign, reason="Automatically assigned new member role.")
@@ -106,8 +116,6 @@ async def on_member_join(member: discord.Member):
             print(f"An error occurred while assigning role: {e}")
     else:
         print(f"Role with ID {role_id_to_assign} not found in guild.")
-
-    # Send a welcome message as a DM to the new member
     welcome_embed = Embed(
         title=f"Welcome to {guild.name}!",
         description=f"Welcome {member.mention} to the server! Please make sure to read the rules.",
@@ -121,22 +129,39 @@ async def on_member_join(member: discord.Member):
     except discord.Forbidden:
         print(f"Failed to send welcome DM to {member.name}: User has DMs disabled.")
 
+@bot.event
+async def on_message(message: discord.Message):
+    """
+    A simple demonstration of how the new whitelisting system works.
+    If the 'censor bad words' feature is enabled, this will check for bad words,
+    but it will bypass the check if the user is whitelisted for that feature.
+    """
+    if message.author.bot:
+        return
+    
+    if bot.config["auto_mod"]["censor_bad_words"]:
+        # Check if the user is whitelisted to bypass this specific feature
+        if is_whitelisted_for_feature(message.author, "auto_mod", "censor_bad_words"):
+            print(f"User {message.author.name} is whitelisted for 'censor bad words', bypassing check.")
+            return
+
+        for word in bot.bad_words:
+            if word in message.content.lower():
+                await message.delete()
+                await message.channel.send(f"Hey {message.author.mention}, that word is not allowed here.", delete_after=5)
+                break
+    
+    await bot.process_commands(message)
+
+
 # --- Antinuke Module Commands and Logic ---
 class AntiNukeView(ui.View):
     """View with buttons for toggling Anti-Nuke features."""
     def __init__(self, bot_instance):
         super().__init__(timeout=None)
         self.bot = bot_instance
-        self.add_item(Button(label="Mass Ban Detection", style=ButtonStyle.blurple, custom_id="mass_ban_btn"))
-        self.add_item(Button(label="Mass Kick Detection", style=ButtonStyle.blurple, custom_id="mass_kick_btn"))
-        self.add_item(Button(label="Channel Spam Detection", style=ButtonStyle.blurple, custom_id="channel_spam_btn"))
-        self.add_item(Button(label="Role Spam Detection", style=ButtonStyle.blurple, custom_id="role_spam_btn"))
-        self.add_item(Button(label="Webhook Spam Detection", style=ButtonStyle.blurple, custom_id="webhook_spam_btn"))
-        self.add_item(Button(label="Bot Add Detection", style=ButtonStyle.blurple, custom_id="bot_add_btn"))
-        self.add_item(Button(label="Role Edit Detection", style=ButtonStyle.blurple, custom_id="role_edit_btn"))
-        self.add_item(Button(label="Channel Edit Detection", style=ButtonStyle.blurple, custom_id="channel_edit_btn"))
-        self.add_item(Button(label="Role Perms Edit", style=ButtonStyle.blurple, custom_id="role_perms_btn"))
-        self.add_item(Button(label="Webhook Creation", style=ButtonStyle.blurple, custom_id="webhook_creation_btn"))
+        for feature in bot_instance.config["anti_nuke"].keys():
+            self.add_item(Button(label=feature.replace('_', ' ').title(), style=ButtonStyle.blurple, custom_id=f"antinuke_{feature}_btn"))
         self.update_buttons()
 
     def update_buttons(self):
@@ -144,7 +169,7 @@ class AntiNukeView(ui.View):
         config = self.bot.config["anti_nuke"]
         for item in self.children:
             if isinstance(item, Button):
-                feature_name = item.custom_id.replace("_btn", "")
+                feature_name = item.custom_id.replace("antinuke_", "").replace("_btn", "")
                 is_enabled = config.get(feature_name, False)
                 item.style = ButtonStyle.green if is_enabled else ButtonStyle.red
                 item.label = f"{'On' if is_enabled else 'Off'}: {feature_name.replace('_', ' ').title()}"
@@ -155,15 +180,14 @@ class AntiNukeView(ui.View):
         if not interaction.permissions.administrator:
             await interaction.response.send_message("You must have administrator permissions to use this.", ephemeral=True)
             return
-
-        feature_id = interaction.data['custom_id'].replace("_btn", "")
+        
+        feature_id = interaction.data['custom_id'].replace("antinuke_", "").replace("_btn", "")
         current_state = self.bot.config["anti_nuke"].get(feature_id, False)
         new_state = not current_state
         self.bot.config["anti_nuke"][feature_id] = new_state
         save_config(self.bot.config)
 
         self.update_buttons()
-
         embed = create_antinuke_embed(self.bot.config["anti_nuke"], interaction.guild, interaction.user)
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -178,10 +202,10 @@ async def antinuke(interaction: Interaction):
 def create_antinuke_embed(config, guild, targetor=None):
     """Generates the Anti-Nuke embed with the new style."""
     embed = Embed(
-        title=f"{guild.name}™ Anti-Nuke",
+        title="EvX Corporation™ Anti-Nuke",
         color=0x00aaff
     )
-    embed.add_field(name="<a:tick:1414542503721570345> General Status", value=f"Click the buttons below to toggle features.", inline=False)
+    embed.add_field(name="<a:tick:1414542503721570345> General Status", value="Click the buttons below to toggle features.", inline=False)
     
     for feature, enabled in config.items():
         status_emoji = "✅" if enabled else "❌"
@@ -204,16 +228,8 @@ class AutoModView(ui.View):
     def __init__(self, bot_instance):
         super().__init__(timeout=None)
         self.bot = bot_instance
-        self.add_item(Button(label="Censor Bad Words", style=ButtonStyle.blurple, custom_id="censor_bad_words_btn"))
-        self.add_item(Button(label="Spam Detection", style=ButtonStyle.blurple, custom_id="spam_detection_btn"))
-        self.add_item(Button(label="Link Spam Detection", style=ButtonStyle.blurple, custom_id="link_spam_detection_btn"))
-        self.add_item(Button(label="Invite Link Blocking", style=ButtonStyle.blurple, custom_id="invite_link_blocking_btn"))
-        self.add_item(Button(label="Caps Lock Detection", style=ButtonStyle.blurple, custom_id="caps_lock_detection_btn"))
-        self.add_item(Button(label="Mention Spam Detection", style=ButtonStyle.blurple, custom_id="mention_spam_detection_btn"))
-        self.add_item(Button(label="Sticker Spam Detection", style=ButtonStyle.blurple, custom_id="sticker_spam_detection_btn"))
-        self.add_item(Button(label="URL Blocking", style=ButtonStyle.blurple, custom_id="url_blocking_btn"))
-        self.add_item(Button(label="File Blocking", style=ButtonStyle.blurple, custom_id="file_blocking_btn"))
-        self.add_item(Button(label="Fast Message Typing", style=ButtonStyle.blurple, custom_id="fast_message_typing_btn"))
+        for feature in bot_instance.config["auto_mod"].keys():
+            self.add_item(Button(label=feature.replace('_', ' ').title(), style=ButtonStyle.blurple, custom_id=f"automod_{feature}_btn"))
         self.update_buttons()
 
     def update_buttons(self):
@@ -221,7 +237,7 @@ class AutoModView(ui.View):
         config = self.bot.config["auto_mod"]
         for item in self.children:
             if isinstance(item, Button):
-                feature_name = item.custom_id.replace("_btn", "")
+                feature_name = item.custom_id.replace("automod_", "").replace("_btn", "")
                 is_enabled = config.get(feature_name, False)
                 item.style = ButtonStyle.green if is_enabled else ButtonStyle.red
                 item.label = f"{'On' if is_enabled else 'Off'}: {feature_name.replace('_', ' ').title()}"
@@ -233,14 +249,13 @@ class AutoModView(ui.View):
             await interaction.response.send_message("You must have administrator permissions to use this.", ephemeral=True)
             return
 
-        feature_id = interaction.data['custom_id'].replace("_btn", "")
+        feature_id = interaction.data['custom_id'].replace("automod_", "").replace("_btn", "")
         current_state = self.bot.config["auto_mod"].get(feature_id, False)
         new_state = not current_state
         self.bot.config["auto_mod"][feature_id] = new_state
         save_config(self.bot.config)
 
         self.update_buttons()
-
         embed = create_automod_embed(self.bot.config["auto_mod"], interaction.guild, interaction.user)
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -255,10 +270,10 @@ async def automod(interaction: Interaction):
 def create_automod_embed(config, guild, targetor=None):
     """Generates the Auto-Mod embed with the new style."""
     embed = Embed(
-        title=f"{guild.name}™ Auto-Mod",
+        title="EvX Corporation™ Auto-Mod",
         color=0x00aaff
     )
-    embed.add_field(name="<a:tick:1414542503721570345> General Status", value=f"Click the buttons below to toggle features.", inline=False)
+    embed.add_field(name="<a:tick:1414542503721570345> General Status", value="Click the buttons below to toggle features.", inline=False)
     
     for feature, enabled in config.items():
         status_emoji = "✅" if enabled else "❌"
@@ -275,33 +290,123 @@ def create_automod_embed(config, guild, targetor=None):
     embed.set_footer(text="Developed by EvX")
     return embed
 
-# --- Whitelisting Commands ---
-@bot.tree.command(name="whitelist", description="Add or remove a user from the whitelist.")
-@app_commands.describe(member="The member to add/remove.", action="Whether to add or remove the member.")
-@app_commands.choices(action=[
-    app_commands.Choice(name="add", value="add"),
-    app_commands.Choice(name="remove", value="remove")
-])
+# --- Permission Management Commands ---
+@bot.tree.command(name="set_permissions", description="Set or clear whitelisted permissions for a member or role.")
+@app_commands.describe(
+    target="The member or role to modify.",
+    module="The module (Anti-Nuke or Auto-Mod).",
+    feature="The specific feature to toggle.",
+    state="Whether to enable (True) or disable (False) the permission."
+)
+@app_commands.choices(
+    module=[
+        app_commands.Choice(name="Anti-Nuke", value="anti_nuke"),
+        app_commands.Choice(name="Auto-Mod", value="auto_mod")
+    ],
+    state=[
+        app_commands.Choice(name="Enable (True)", value=True),
+        app_commands.Choice(name="Disable (False)", value=False)
+    ]
+)
 @app_commands.default_permissions(administrator=True)
-async def whitelist(interaction: Interaction, member: discord.Member, action: str):
-    """Adds or removes a member from the bot's whitelist."""
-    whitelisted_ids = bot.config["whitelisted_ids"]
-    user_id = str(member.id)
+async def set_permissions(interaction: Interaction, target: Union[discord.Member, discord.Role], module: str, feature: str, state: bool):
+    """Dynamically populates the feature choices based on the selected module."""
+    if module == "anti_nuke":
+        features = list(bot.config["anti_nuke"].keys())
+    elif module == "auto_mod":
+        features = list(bot.config["auto_mod"].keys())
+    else:
+        await interaction.response.send_message("Invalid module selected.", ephemeral=True)
+        return
 
-    if action == "add":
-        if user_id in whitelisted_ids:
-            await interaction.response.send_message(f"{member.mention} is already whitelisted.", ephemeral=True)
-        else:
-            whitelisted_ids.append(user_id)
-            save_config(bot.config)
-            await interaction.response.send_message(f"{EMOJI_IDS['tick']} {member.mention} has been added to the whitelist.", ephemeral=True)
-    elif action == "remove":
-        if user_id not in whitelisted_ids:
-            await interaction.response.send_message(f"{member.mention} is not in the whitelist.", ephemeral=True)
-        else:
-            whitelisted_ids.remove(user_id)
-            save_config(bot.config)
-            await interaction.response.send_message(f"{EMOJI_IDS['tick']} {member.mention} has been removed from the whitelist.", ephemeral=True)
+    if feature not in features:
+        await interaction.response.send_message(f"Feature '{feature}' not found in module '{module}'.", ephemeral=True)
+        return
+
+    permissions = bot.config["whitelisted_permissions"]
+    target_id = str(target.id)
+
+    if target_id not in permissions:
+        permissions[target_id] = {"anti_nuke": {}, "auto_mod": {}}
+    
+    permissions[target_id][module][feature] = state
+    save_config(bot.config)
+
+    action = "enabled" if state else "disabled"
+    embed = Embed(
+        title="Permissions Updated",
+        description=f"Permissions for {target.mention} have been updated.",
+        color=0x2ecc71
+    )
+    embed.add_field(
+        name=f"{feature.replace('_', ' ').title()}",
+        value=f"**{action.capitalize()}** in the `{module.replace('_', ' ').title()}` module.",
+        inline=False
+    )
+    embed.set_footer(text=f"Action requested by {interaction.user.name}", icon_url=interaction.user.avatar.url)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@set_permissions.autocomplete('feature')
+async def feature_autocomplete(interaction: Interaction, current: str):
+    """Autocompletes the feature choices based on the module."""
+    module = interaction.namespace.module
+    if module == "anti_nuke":
+        choices = list(bot.config["anti_nuke"].keys())
+    elif module == "auto_mod":
+        choices = list(bot.config["auto_mod"].keys())
+    else:
+        return []
+    
+    return [
+        app_commands.Choice(name=f.replace('_', ' ').title(), value=f)
+        for f in choices if current.lower() in f.lower()
+    ]
+
+@bot.tree.command(name="list_permissions", description="List the whitelisted permissions for a member or role.")
+@app_commands.describe(target="The member or role to check.")
+@app_commands.default_permissions(administrator=True)
+async def list_permissions(interaction: Interaction, target: Union[discord.Member, discord.Role]):
+    """Lists all permissions for a member or role."""
+    permissions = bot.config["whitelisted_permissions"]
+    target_id = str(target.id)
+
+    if target_id not in permissions or (not permissions[target_id]["anti_nuke"] and not permissions[target_id]["auto_mod"]):
+        await interaction.response.send_message(f"No custom permissions found for {target.mention}.", ephemeral=True)
+        return
+
+    embed = Embed(
+        title=f"Whitelisted Permissions for {target.name}",
+        description=f"Showing special permissions for {target.mention}.",
+        color=0x3498db
+    )
+    
+    # Anti-Nuke Permissions
+    antinuke_perms = permissions[target_id].get("anti_nuke", {})
+    antinuke_list = []
+    for feature, state in antinuke_perms.items():
+        status = "✅ Enabled" if state else "❌ Disabled"
+        antinuke_list.append(f"`{feature.replace('_', ' ').title()}`: {status}")
+    embed.add_field(
+        name="Anti-Nuke Permissions",
+        value="\n".join(antinuke_list) if antinuke_list else "No custom permissions set.",
+        inline=False
+    )
+
+    # Auto-Mod Permissions
+    automod_perms = permissions[target_id].get("auto_mod", {})
+    automod_list = []
+    for feature, state in automod_perms.items():
+        status = "✅ Enabled" if state else "❌ Disabled"
+        automod_list.append(f"`{feature.replace('_', ' ').title()}`: {status}")
+    embed.add_field(
+        name="Auto-Mod Permissions",
+        value="\n".join(automod_list) if automod_list else "No custom permissions set.",
+        inline=False
+    )
+    
+    embed.set_footer(text=f"Requested by {interaction.user.name}", icon_url=interaction.user.avatar.url)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 # --- Embed Creation Commands ---
 @bot.tree.command(name="create_embed", description="Creates a custom embed message.")
@@ -333,6 +438,42 @@ async def create_embed(interaction: Interaction, title: str, description: str, c
     except Exception as e:
         await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
 
+# --- About Me Commands and Logic ---
+class AboutView(ui.View):
+    """View with a button to show developer information."""
+    def __init__(self):
+        super().__init__(timeout=180)
+        
+    @ui.button(label="Developer", style=ButtonStyle.primary)
+    async def developer_button(self, interaction: Interaction, button: ui.Button):
+        developer_embed = Embed(
+            title="About the Developer",
+            description="""
+            EvX is a professional developer specializing in creating high-quality, reliable, and secure Discord bots. 
+            He has a strong passion for coding and building tools that help communities grow and stay protected.
+            
+            This bot is a testament to his expertise and dedication.
+            """,
+            color=0x00aaff
+        )
+        developer_embed.set_footer(text="Thank you for supporting EvX!")
+        await interaction.response.send_message(embed=developer_embed, ephemeral=True)
+
+@bot.tree.command(name="about", description="Get information about the bot and the developer.")
+async def about(interaction: Interaction):
+    """Sends an embed with information about the bot."""
+    about_embed = Embed(
+        title="About EvX Corporation Bot",
+        description="A powerful bot for server security and moderation, with features like Anti-Nuke, Auto-Mod, and custom embed creation.",
+        color=0x4a90e2
+    )
+    about_embed.set_thumbnail(url=bot.user.avatar.url)
+    about_embed.set_footer(text="Developed to keep your server safe.")
+    
+    view = AboutView()
+    await interaction.response.send_message(embed=about_embed, view=view)
+
+
 # --- Ticket Embed Creation ---
 class TicketButton(ui.View):
     """View with a button to create a ticket."""
@@ -348,13 +489,11 @@ class TicketButton(ui.View):
         member = interaction.user
         ticket_channel_name = f"ticket-{member.name.lower()}-{member.discriminator}".replace("#", "")
 
-        # Check if a ticket channel already exists for the user
         for channel in guild.channels:
             if channel.name == ticket_channel_name:
                 await interaction.response.send_message("You already have an open ticket.", ephemeral=True)
                 return
 
-        # Create a new private channel for the ticket
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
@@ -364,7 +503,6 @@ class TicketButton(ui.View):
         
         await interaction.response.send_message(f"Your ticket has been created at {ticket_channel.mention}", ephemeral=True)
 
-        # Send a message inside the ticket channel
         ticket_embed = Embed(
             title=f"New Ticket from {member.name}",
             description="Our team will be with you shortly. Please explain your issue.",
@@ -393,7 +531,7 @@ class TicketButton(ui.View):
 async def ticket_panel(interaction: Interaction):
     """Sends a ticket panel with a button to create tickets."""
     ticket_embed = Embed(
-        title=f"{interaction.guild.name}™ Ticket System",
+        title="EvX Corporation™ Ticket System",
         description="Need help? Click the button below to create a private support ticket.",
         color=0x00aaff
     )
@@ -420,10 +558,13 @@ def run_web_server():
         httpd.serve_forever()
 
 # --- Start the bot and web server ---
+@bot.event
+async def on_connect():
+    """Event that runs when the bot connects to Discord."""
+    bot.add_view(AntiNukeView(bot))
+    bot.add_view(AutoModView(bot))
+
 if __name__ == "__main__":
-    # Start the web server in a separate thread
     web_server_thread = threading.Thread(target=run_web_server, daemon=True)
     web_server_thread.start()
-
-    # Start the bot
     bot.run(TOKEN)
