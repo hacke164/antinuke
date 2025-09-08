@@ -1,413 +1,419 @@
-# bot.py
-import os
 import discord
-from discord import app_commands
 from discord.ext import commands
-from typing import Optional
+import os
+import json
+from discord import app_commands, Embed, Interaction, ButtonStyle, ui, Permissions
+from discord.ui import Button, View
 
-# ---------------- CONFIG ----------------
-TOKEN = os.getenv("TOKEN")  # set this in Render environment variables
+# --- Configuration and Data Persistence ---
+CONFIG_FILE = 'config.json'
 
+def load_config():
+    """Loads configuration from a JSON file."""
+    if not os.path.exists(CONFIG_FILE):
+        return {
+            "anti_nuke": {
+                "mass_ban_detection": True,
+                "mass_kick_detection": True,
+                "channel_spam_detection": True,
+                "role_spam_detection": True,
+                "webhook_spam_detection": True,
+                "bot_add_detection": True,
+                "role_edit_detection": True,
+                "channel_edit_detection": True,
+                "role_permission_edit": True,
+                "webhook_creation": True
+            },
+            "auto_mod": {
+                "censor_bad_words": True,
+                "spam_detection": True,
+                "link_spam_detection": True,
+                "invite_link_blocking": True,
+                "caps_lock_detection": True,
+                "mention_spam_detection": True,
+                "sticker_spam_detection": True,
+                "url_blocking": True,
+                "file_blocking": True,
+                "fast_message_typing": True
+            },
+            "whitelisted_ids": []
+        }
+    with open(CONFIG_FILE, 'r') as f:
+        return json.load(f)
+
+def save_config(config_data):
+    """Saves configuration to a JSON file."""
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config_data, f, indent=4)
+
+# --- Bot Initialization ---
+# Get the bot token from the environment variable (Render hosting)
+TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
-    raise RuntimeError("TOKEN environment variable not set")
+    print("Error: TOKEN environment variable not set.")
+    exit()
 
-# Replace with your constants (update LOG_CHANNEL_ID if you want)
-WELCOME_ROLE_ID = 1412416423652757556  # auto-role to give new members
-LOG_CHANNEL_ID = None  # set to integer ID if you want a fixed log channel, or leave None to find by name
+# Define bot intents to get the necessary permissions
+intents = discord.Intents.default()
+intents.members = True  # Required for on_member_join
+intents.message_content = True  # Required for message content monitoring
+intents.guilds = True  # Required for guild and role info
 
-# Custom emoji IDs (replace with IDs from your server if different)
+# Initialize the bot with intents
+bot = commands.Bot(command_prefix='!', intents=intents)
+bot.config = load_config()
+
+# Define the animated emoji IDs
 EMOJI_IDS = {
-    "buy": 1414542537938698271,
-    "tick": 1414542503721570345,
-    "welcome": 1414542454056685631
+    "buy": "<a:buy:1414542537938698271>",
+    "tick": "<a:tick:1414542503721570345>",
+    "welcome": "<a:welcome:1414542454056685631>"
 }
 
-# ---------------- INTENTS & BOT ----------------
-intents = discord.Intents.default()
-intents.members = True
-intents.guilds = True
-intents.messages = True
-intents.message_content = True
+# --- Bot Events ---
+@bot.event
+async def on_ready():
+    """Confirms the bot is online and ready."""
+    print(f'Logged in as {bot.user.name} ({bot.user.id})')
+    print('------')
+    # Sync slash commands with the guilds
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
 
-class SecurityBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents, application_id=None)
-        # in-memory stores (consider persisting to DB later)
-        self.anti_nuke_enabled: dict[int, bool] = {}
-        self.automod_enabled: dict[int, bool] = {}
-        self.whitelist: dict[int, list[int]] = {}
-        self.user_message_cache: dict[tuple[int,int], list[float]] = {}  # (guild_id,user_id) -> timestamps
-        self.ticket_category_name = "Tickets"
-        # mapping ticket channel id -> owner id
-        self.open_tickets: dict[int, int] = {}
-
-    async def setup_hook(self):
-        # sync commands on startup
-        await self.tree.sync()
-
-bot = SecurityBot()
-
-# ---------------- HELPERS ----------------
-def is_admin() -> app_commands.check:
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ You must have Administrator permissions.", ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
-
-def get_custom_emoji_str(guild: discord.Guild, name: str) -> str:
-    eid = EMOJI_IDS.get(name)
-    if not eid:
-        return ""
-    emoji = guild.get_emoji(eid)
-    if emoji:
-        return str(emoji)
-    # fallback to raw form (works if emoji is in a server the bot can access)
-    return f"<:emoji_{name}:{eid}>"
-
-async def send_log(guild: discord.Guild, embed: discord.Embed):
-    # priority: LOG_CHANNEL_ID if set -> channel named "mod-logs" or "bot-logs" -> first channel bot can send in
-    channel = None
-    if LOG_CHANNEL_ID:
-        channel = guild.get_channel(LOG_CHANNEL_ID) or bot.get_channel(LOG_CHANNEL_ID)
-    if not channel:
-        for ch in guild.text_channels:
-            if ch.permissions_for(guild.me).send_messages and ("mod" in ch.name.lower() or "log" in ch.name.lower() or "bot" in ch.name.lower()):
-                channel = ch
-                break
-    if not channel:
-        for ch in guild.text_channels:
-            if ch.permissions_for(guild.me).send_messages:
-                channel = ch
-                break
-    if channel:
-        try:
-            await channel.send(embed=embed)
-        except Exception:
-            pass
-
-# ---------------- WELCOME & AUTO-ROLE ----------------
 @bot.event
 async def on_member_join(member: discord.Member):
+    """Handles new members joining the server."""
     guild = member.guild
-    # give role
-    role = guild.get_role(WELCOME_ROLE_ID)
-    if role:
+
+    # Assign the lowest role (just above @everyone)
+    roles = sorted(guild.roles, key=lambda r: r.position)
+    lowest_role = None
+    for role in roles:
+        if role.name != '@everyone':
+            lowest_role = role
+            break
+    if lowest_role:
         try:
-            await member.add_roles(role, reason="Auto role assignment")
-        except Exception:
-            pass
+            await member.add_roles(lowest_role, reason="Automatically assigned lowest role on join.")
+            print(f"Assigned lowest role '{lowest_role.name}' to {member.name}")
+        except discord.Forbidden:
+            print(f"Failed to assign role to {member.name}: Bot lacks permissions.")
 
-    # emojis
-    emoji_buy = get_custom_emoji_str(guild, "buy")
-    emoji_tick = get_custom_emoji_str(guild, "tick")
-    emoji_welcome = get_custom_emoji_str(guild, "welcome")
-
-    # public welcome embed (system channel preferred)
-    embed = discord.Embed(
-        title=f"{emoji_welcome} Welcome to {guild.name}!",
-        description=(f"{emoji_tick} {member.mention} — you have been assigned the starter role.\n\n"
-                     f"Explore the server and have fun!\n\n"
-                     f"{emoji_buy} DM **@exhaust_xx** to buy premium access."),
-        color=discord.Color.green()
-    )
-    channel = guild.system_channel or next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
-    if channel:
-        try:
-            await channel.send(embed=embed)
-        except Exception:
-            pass
-
-    # DM the user
-    try:
-        dm_embed = discord.Embed(
-            title=f"{emoji_welcome} Welcome!",
-            description=(f"Hey {member.name}, welcome to **{guild.name}**!\n\n"
-                         f"{emoji_tick} You've received your starter role.\n"
-                         f"{emoji_buy} DM **@exhaust_xx** to purchase premium features."),
-            color=discord.Color.blue()
+    # Send a welcome message in a specific channel
+    channel = discord.utils.get(guild.channels, name="welcome")
+    if channel and isinstance(channel, discord.TextChannel):
+        welcome_embed = Embed(
+            title=f"Welcome to {guild.name}!",
+            description=f"Welcome {member.mention} to the server! Please make sure to read the rules.",
+            color=0x4a90e2
         )
-        await member.send(embed=dm_embed)
-    except Exception:
-        pass
+        welcome_embed.set_thumbnail(url=member.display_avatar.url)
+        welcome_embed.set_footer(text=f"Member count: {guild.member_count}")
+        await channel.send(f"{EMOJI_IDS['welcome']} {member.mention}", embed=welcome_embed)
 
-# ---------------- ANTI-NUKE COMMANDS ----------------
-@bot.tree.command(name="antinuke", description="Toggle or check anti-nuke protection")
-@is_admin()
-async def antinuke(interaction: discord.Interaction, action: Optional[str] = "status"):
-    guild_id = interaction.guild.id
-    if action.lower() == "toggle":
-        current = bot.anti_nuke_enabled.get(guild_id, False)
-        bot.anti_nuke_enabled[guild_id] = not current
-        status_text = "✅ Enabled" if not current else "❌ Disabled"
-        embed = discord.Embed(title=f"Anti-Nuke | {interaction.guild.name}",
-                              description=f"Anti-Nuke has been **{status_text}**",
-                              color=discord.Color.red())
-        await interaction.response.send_message(embed=embed)
-        await send_log(interaction.guild, embed)
-    else:  # status
-        status_text = "✅ Enabled" if bot.anti_nuke_enabled.get(guild_id, False) else "❌ Disabled"
-        embed = discord.Embed(title=f"Anti-Nuke | {interaction.guild.name}",
-                              description=f"Current Status: {status_text}",
-                              color=discord.Color.blue())
-        await interaction.response.send_message(embed=embed)
+# --- Antinuke Module Commands and Logic ---
+class AntiNukeView(ui.View):
+    """View with buttons for toggling Anti-Nuke features."""
+    def __init__(self, bot_instance):
+        super().__init__(timeout=None)
+        self.bot = bot_instance
+        self.add_item(Button(label="Mass Ban Detection", style=ButtonStyle.blurple, custom_id="mass_ban_btn"))
+        self.add_item(Button(label="Mass Kick Detection", style=ButtonStyle.blurple, custom_id="mass_kick_btn"))
+        self.add_item(Button(label="Channel Spam Detection", style=ButtonStyle.blurple, custom_id="channel_spam_btn"))
+        self.add_item(Button(label="Role Spam Detection", style=ButtonStyle.blurple, custom_id="role_spam_btn"))
+        self.add_item(Button(label="Webhook Spam Detection", style=ButtonStyle.blurple, custom_id="webhook_spam_btn"))
+        self.add_item(Button(label="Bot Add Detection", style=ButtonStyle.blurple, custom_id="bot_add_btn"))
+        self.add_item(Button(label="Role Edit Detection", style=ButtonStyle.blurple, custom_id="role_edit_btn"))
+        self.add_item(Button(label="Channel Edit Detection", style=ButtonStyle.blurple, custom_id="channel_edit_btn"))
+        self.add_item(Button(label="Role Perms Edit", style=ButtonStyle.blurple, custom_id="role_perms_btn"))
+        self.add_item(Button(label="Webhook Creation", style=ButtonStyle.blurple, custom_id="webhook_creation_btn"))
+        self.update_buttons()
 
-# ---------------- AUTOMOD COMMANDS ----------------
-@bot.tree.command(name="automod", description="Toggle or check AutoMod")
-@is_admin()
-async def automod(interaction: discord.Interaction, action: Optional[str] = "status"):
-    guild_id = interaction.guild.id
-    if action.lower() == "toggle":
-        current = bot.automod_enabled.get(guild_id, False)
-        bot.automod_enabled[guild_id] = not current
-        status_text = "✅ Enabled" if not current else "❌ Disabled"
-        embed = discord.Embed(title=f"AutoMod | {interaction.guild.name}",
-                              description=f"AutoMod has been **{status_text}**",
-                              color=discord.Color.green())
-        await interaction.response.send_message(embed=embed)
-        await send_log(interaction.guild, embed)
-    else:
-        status_text = "✅ Enabled" if bot.automod_enabled.get(guild_id, False) else "❌ Disabled"
-        embed = discord.Embed(title=f"AutoMod | {interaction.guild.name}",
-                              description=f"Current Status: {status_text}",
-                              color=discord.Color.purple())
-        await interaction.response.send_message(embed=embed)
+    def update_buttons(self):
+        """Updates button styles based on current config."""
+        config = self.bot.config["anti_nuke"]
+        for item in self.children:
+            if isinstance(item, Button):
+                feature_name = item.custom_id.replace("_btn", "")
+                is_enabled = config.get(feature_name, False)
+                item.style = ButtonStyle.green if is_enabled else ButtonStyle.red
+                item.label = f"{'On' if is_enabled else 'Off'}: {feature_name.replace('_', ' ').title()}"
 
-# ---------------- WHITELIST COMMANDS ----------------
-@bot.tree.command(name="whitelist", description="Manage server whitelist")
-@is_admin()
-async def whitelist(interaction: discord.Interaction, action: str, member: Optional[discord.Member] = None):
-    guild_id = interaction.guild.id
-    bot.whitelist.setdefault(guild_id, [])
+    async def callback(self, interaction: Interaction):
+        """Handles button clicks."""
+        user = interaction.user
+        if not interaction.permissions.administrator:
+            await interaction.response.send_message("You must have administrator permissions to use this.", ephemeral=True)
+            return
 
-    if action.lower() == "add" and member:
-        if member.id not in bot.whitelist[guild_id]:
-            bot.whitelist[guild_id].append(member.id)
-        e = discord.Embed(title=f"Whitelist | {interaction.guild.name}",
-                          description=f"✅ {member.mention} added to whitelist.",
-                          color=discord.Color.green())
-        await interaction.response.send_message(embed=e)
-        await send_log(interaction.guild, e)
+        feature_id = interaction.data['custom_id'].replace("_btn", "")
+        current_state = self.bot.config["anti_nuke"].get(feature_id, False)
+        new_state = not current_state
+        self.bot.config["anti_nuke"][feature_id] = new_state
+        save_config(self.bot.config)
+
+        self.update_buttons()
+
+        embed = create_antinuke_embed(self.bot.config["anti_nuke"], interaction.guild, interaction.user)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+@bot.tree.command(name="antinuke", description="Manage the Anti-Nuke module features.")
+@app_commands.default_permissions(administrator=True)
+async def antinuke(interaction: Interaction):
+    """Sends an embed with buttons to manage Anti-Nuke features."""
+    if interaction.guild and interaction.guild.name != "EvX Corp":
+        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
         return
 
-    if action.lower() == "remove" and member:
-        if member.id in bot.whitelist[guild_id]:
-            bot.whitelist[guild_id].remove(member.id)
-            e = discord.Embed(title=f"Whitelist | {interaction.guild.name}",
-                              description=f"❌ {member.mention} removed from whitelist.",
-                              color=discord.Color.red())
-            await interaction.response.send_message(embed=e)
-            await send_log(interaction.guild, e)
+    embed = create_antinuke_embed(bot.config["anti_nuke"], interaction.guild, interaction.user)
+    view = AntiNukeView(bot)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+def create_antinuke_embed(config, guild, targetor=None):
+    """Generates the Anti-Nuke embed with the new style."""
+    embed = Embed(
+        title=f"{guild.name}™ Anti-Nuke",
+        color=0x00aaff
+    )
+    embed.add_field(name="<a:tick:1414542503721570345> General Status", value=f"Click the buttons below to toggle features.", inline=False)
+    
+    for feature, enabled in config.items():
+        status_emoji = "✅" if enabled else "❌"
+        embed.add_field(
+            name=f"{status_emoji} : {feature.replace('_', ' ').title()}",
+            value="",
+            inline=False
+        )
+    
+    if targetor:
+        embed.add_field(name="Executor", value=f"<@{targetor.id}>", inline=True)
+        embed.add_field(name="Target", value=f"<@{targetor.id}>", inline=True)
+    
+    embed.set_footer(text="Developed by EvX")
+    return embed
+
+# --- Automod Module Commands and Logic ---
+class AutoModView(ui.View):
+    """View with buttons for toggling Auto-Mod features."""
+    def __init__(self, bot_instance):
+        super().__init__(timeout=None)
+        self.bot = bot_instance
+        self.add_item(Button(label="Censor Bad Words", style=ButtonStyle.blurple, custom_id="censor_bad_words_btn"))
+        self.add_item(Button(label="Spam Detection", style=ButtonStyle.blurple, custom_id="spam_detection_btn"))
+        self.add_item(Button(label="Link Spam Detection", style=ButtonStyle.blurple, custom_id="link_spam_detection_btn"))
+        self.add_item(Button(label="Invite Link Blocking", style=ButtonStyle.blurple, custom_id="invite_link_blocking_btn"))
+        self.add_item(Button(label="Caps Lock Detection", style=ButtonStyle.blurple, custom_id="caps_lock_detection_btn"))
+        self.add_item(Button(label="Mention Spam Detection", style=ButtonStyle.blurple, custom_id="mention_spam_detection_btn"))
+        self.add_item(Button(label="Sticker Spam Detection", style=ButtonStyle.blurple, custom_id="sticker_spam_detection_btn"))
+        self.add_item(Button(label="URL Blocking", style=ButtonStyle.blurple, custom_id="url_blocking_btn"))
+        self.add_item(Button(label="File Blocking", style=ButtonStyle.blurple, custom_id="file_blocking_btn"))
+        self.add_item(Button(label="Fast Message Typing", style=ButtonStyle.blurple, custom_id="fast_message_typing_btn"))
+        self.update_buttons()
+
+    def update_buttons(self):
+        """Updates button styles based on current config."""
+        config = self.bot.config["auto_mod"]
+        for item in self.children:
+            if isinstance(item, Button):
+                feature_name = item.custom_id.replace("_btn", "")
+                is_enabled = config.get(feature_name, False)
+                item.style = ButtonStyle.green if is_enabled else ButtonStyle.red
+                item.label = f"{'On' if is_enabled else 'Off'}: {feature_name.replace('_', ' ').title()}"
+
+    async def callback(self, interaction: Interaction):
+        """Handles button clicks."""
+        user = interaction.user
+        if not interaction.permissions.administrator:
+            await interaction.response.send_message("You must have administrator permissions to use this.", ephemeral=True)
             return
+
+        feature_id = interaction.data['custom_id'].replace("_btn", "")
+        current_state = self.bot.config["auto_mod"].get(feature_id, False)
+        new_state = not current_state
+        self.bot.config["auto_mod"][feature_id] = new_state
+        save_config(self.bot.config)
+
+        self.update_buttons()
+
+        embed = create_automod_embed(self.bot.config["auto_mod"], interaction.guild, interaction.user)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+@bot.tree.command(name="automod", description="Manage the Auto-Mod module features.")
+@app_commands.default_permissions(administrator=True)
+async def automod(interaction: Interaction):
+    """Sends an embed with buttons to manage Auto-Mod features."""
+    if interaction.guild and interaction.guild.name != "EvX Corp":
+        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
+        return
+
+    embed = create_automod_embed(bot.config["auto_mod"], interaction.guild, interaction.user)
+    view = AutoModView(bot)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+def create_automod_embed(config, guild, targetor=None):
+    """Generates the Auto-Mod embed with the new style."""
+    embed = Embed(
+        title=f"{guild.name}™ Auto-Mod",
+        color=0x00aaff
+    )
+    embed.add_field(name="<a:tick:1414542503721570345> General Status", value=f"Click the buttons below to toggle features.", inline=False)
+    
+    for feature, enabled in config.items():
+        status_emoji = "✅" if enabled else "❌"
+        embed.add_field(
+            name=f"{status_emoji} : {feature.replace('_', ' ').title()}",
+            value="",
+            inline=False
+        )
+
+    if targetor:
+        embed.add_field(name="Executor", value=f"<@{targetor.id}>", inline=True)
+        embed.add_field(name="Target", value=f"<@{targetor.id}>", inline=True)
+    
+    embed.set_footer(text="Developed by EvX")
+    return embed
+
+# --- Whitelisting Commands ---
+@bot.tree.command(name="whitelist", description="Add or remove a user from the whitelist.")
+@app_commands.describe(member="The member to add/remove.", action="Whether to add or remove the member.")
+@app_commands.choices(action=[
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove")
+])
+@app_commands.default_permissions(administrator=True)
+async def whitelist(interaction: Interaction, member: discord.Member, action: str):
+    """Adds or removes a member from the bot's whitelist."""
+    if interaction.guild and interaction.guild.name != "EvX Corp":
+        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
+        return
+
+    whitelisted_ids = bot.config["whitelisted_ids"]
+    user_id = str(member.id)
+
+    if action == "add":
+        if user_id in whitelisted_ids:
+            await interaction.response.send_message(f"{member.mention} is already whitelisted.", ephemeral=True)
         else:
-            await interaction.response.send_message("User not in whitelist.", ephemeral=True)
-            return
+            whitelisted_ids.append(user_id)
+            save_config(bot.config)
+            await interaction.response.send_message(f"{EMOJI_IDS['tick']} {member.mention} has been added to the whitelist.", ephemeral=True)
+    elif action == "remove":
+        if user_id not in whitelisted_ids:
+            await interaction.response.send_message(f"{member.mention} is not in the whitelist.", ephemeral=True)
+        else:
+            whitelisted_ids.remove(user_id)
+            save_config(bot.config)
+            await interaction.response.send_message(f"{EMOJI_IDS['tick']} {member.mention} has been removed from the whitelist.", ephemeral=True)
 
-    if action.lower() == "list":
-        members = bot.whitelist.get(guild_id, [])
-        desc = "\n".join(f"<@{m}>" for m in members) if members else "No users whitelisted."
-        e = discord.Embed(title=f"Whitelist | {interaction.guild.name}", description=desc, color=discord.Color.blue())
-        await interaction.response.send_message(embed=e)
+# --- Embed Creation Commands ---
+@bot.tree.command(name="create_embed", description="Creates a custom embed message.")
+@app_commands.describe(
+    title="The title of the embed.",
+    description="The main text of the embed.",
+    color="The color of the embed (hex code, e.g., 0x3498db).",
+    url="A URL for the title link.",
+    image_url="A URL for the main image.",
+    thumbnail_url="A URL for the thumbnail image."
+)
+@app_commands.default_permissions(administrator=True)
+async def create_embed(interaction: Interaction, title: str, description: str, color: int = 0x3498db, url: str = None, image_url: str = None, thumbnail_url: str = None):
+    """Creates a custom embed with provided details."""
+    if interaction.guild and interaction.guild.name != "EvX Corp":
+        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
         return
 
-    await interaction.response.send_message("Invalid usage. Example: `/whitelist add @user`", ephemeral=True)
-
-# ---------------- EMBED GENERATOR ----------------
-@bot.tree.command(name="embed", description="Generate a custom embed (admin only)")
-@is_admin()
-async def embed_create(interaction: discord.Interaction, title: str, description: str, color: Optional[str] = "#3498db"):
     try:
-        color_val = int(color.replace("#", ""), 16)
-    except Exception:
-        color_val = 0x3498db
-    e = discord.Embed(title=title, description=description, color=color_val)
-    e.set_footer(text=f"Requested by {interaction.user}")
-    await interaction.response.send_message(embed=e)
+        embed = Embed(
+            title=title,
+            description=description,
+            color=color,
+            url=url
+        )
+        if image_url:
+            embed.set_image(url=image_url)
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
 
-# ---------------- AUTOMOD DETECTION (spam, mass mention, links, profanity) ----------------
-BAD_WORDS = {"badword1", "badword2"}
+        embed.set_footer(text=f"Embed created by {interaction.user.name}", icon_url=interaction.user.avatar.url)
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
 
-@bot.event
-async def on_message(message: discord.Message):
-    # ignore bots and DMs
-    if message.author.bot or message.guild is None:
-        return
+# --- Ticket Embed Creation ---
+class TicketButton(ui.View):
+    """View with a button to create a ticket."""
+    def __init__(self, bot_instance):
+        super().__init__(timeout=None)
+        self.bot = bot_instance
+        self.add_item(Button(label="Create Ticket", style=ButtonStyle.blurple, custom_id="create_ticket_btn"))
 
-    guild_id = message.guild.id
+    @ui.button(label="Create Ticket", style=ButtonStyle.blurple, custom_id="create_ticket_btn")
+    async def create_ticket(self, interaction: Interaction, button: Button):
+        """Creates a ticket channel for the user."""
+        guild = interaction.guild
+        member = interaction.user
+        ticket_channel_name = f"ticket-{member.name.lower()}-{member.discriminator}".replace("#", "")
 
-    # whitelisted users skip automod
-    if guild_id in bot.whitelist and message.author.id in bot.whitelist[guild_id]:
-        await bot.process_commands(message)
-        return
-
-    # only run automod when enabled for guild
-    if bot.automod_enabled.get(guild_id, False):
-        # spam detection: 5 messages in 5 seconds
-        key = (guild_id, message.author.id)
-        ts_list = bot.user_message_cache.get(key, [])
-        ts_list.append(message.created_at.timestamp())
-        # keep last 6 timestamps
-        ts_list = ts_list[-6:]
-        bot.user_message_cache[key] = ts_list
-        if len(ts_list) >= 5:
-            if ts_list[-1] - ts_list[-5] < 5:  # 5 messages in <5 seconds
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-                embed = discord.Embed(title="🚨 AutoMod — Spam Detected",
-                                      description=f"{message.author.mention} was spamming messages and a message was removed.",
-                                      color=discord.Color.orange())
-                await send_log(message.guild, embed)
-                # optionally notify channel
-                try:
-                    await message.channel.send(f"⚠️ {message.author.mention}, please avoid spamming.", delete_after=6)
-                except Exception:
-                    pass
-                await bot.process_commands(message)
+        # Check if a ticket channel already exists for the user
+        for channel in guild.channels:
+            if channel.name == ticket_channel_name:
+                await interaction.response.send_message("You already have an open ticket.", ephemeral=True)
                 return
 
-        # mass mentions
-        if len(message.mentions) >= 5 or message.mention_everyone:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            embed = discord.Embed(title="🚨 AutoMod — Mass Mention",
-                                  description=f"{message.author.mention} attempted to mass-mention users. Message removed.",
-                                  color=discord.Color.orange())
-            await send_log(message.guild, embed)
-            try:
-                await message.channel.send(f"⚠️ {message.author.mention}, mass mentions are not allowed.", delete_after=6)
-            except Exception:
-                pass
-            await bot.process_commands(message)
-            return
-
-        # link blocking
-        if "http://" in message.content or "https://" in message.content or "discord.gg/" in message.content:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            embed = discord.Embed(title="🚨 AutoMod — Link Blocked",
-                                  description=f"{message.author.mention} posted a link. Message removed.",
-                                  color=discord.Color.orange())
-            await send_log(message.guild, embed)
-            try:
-                await message.channel.send(f"⚠️ {message.author.mention}, posting links is not allowed here.", delete_after=6)
-            except Exception:
-                pass
-            await bot.process_commands(message)
-            return
-
-        # profanity
-        lower = message.content.lower()
-        if any(bad in lower for bad in BAD_WORDS):
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            embed = discord.Embed(title="🚨 AutoMod — Profanity",
-                                  description=f"{message.author.mention} used protected language. Message removed.",
-                                  color=discord.Color.orange())
-            await send_log(message.guild, embed)
-            try:
-                await message.channel.send(f"⚠️ {message.author.mention}, please avoid profanity.", delete_after=6)
-            except Exception:
-                pass
-            await bot.process_commands(message)
-            return
-
-    # process commands at the end
-    await bot.process_commands(message)
-
-# ---------------- TICKET SYSTEM (interactive embed + buttons) ----------------
-class TicketCreateView(discord.ui.View):
-    def __init__(self, *, timeout: Optional[float] = None):
-        super().__init__(timeout=timeout)
-
-    @discord.ui.button(label="🎫 Create Ticket", style=discord.ButtonStyle.primary, custom_id="create_ticket")
-    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        author = interaction.user
-
-        # Create or find "Tickets" category
-        category = discord.utils.get(guild.categories, name=bot.ticket_category_name)
-        if not category:
-            try:
-                category = await guild.create_category(bot.ticket_category_name)
-            except Exception:
-                category = None
-
-        # Build permissions: hide from @everyone, show to author and admins
+        # Create a new private channel for the ticket
         overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
         }
+        ticket_channel = await guild.create_text_channel(ticket_channel_name, overwrites=overwrites)
+        
+        await interaction.response.send_message(f"Your ticket has been created at {ticket_channel.mention}", ephemeral=True)
 
-        # add admin roles (roles with administrator) to overwrites
-        for role in guild.roles:
-            if role.permissions.administrator:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
+        # Send a message inside the ticket channel
+        ticket_embed = Embed(
+            title=f"New Ticket from {member.name}",
+            description="Our team will be with you shortly. Please explain your issue.",
+            color=0x2ecc71
+        )
+        ticket_embed.set_footer(text=f"Ticket ID: {ticket_channel.id}")
+        
+        close_button_view = ui.View()
+        close_button_view.add_item(Button(label="Close Ticket", style=ButtonStyle.red, custom_id="close_ticket_btn"))
 
-        # create the channel
-        chan_name = f"ticket-{author.name}-{author.discriminator}"
-        try:
-            channel = await guild.create_text_channel(chan_name, category=category, overwrites=overwrites, reason="Ticket created")
-        except Exception:
-            await interaction.response.send_message("⚠️ Failed to create ticket channel. Please contact staff.", ephemeral=True)
-            return
+        await ticket_channel.send(member.mention, embed=ticket_embed, view=close_button_view)
 
-        # store owner
-        bot.open_tickets[channel.id] = author.id
+    @ui.button(label="Close Ticket", style=ButtonStyle.red, custom_id="close_ticket_btn")
+    async def close_ticket(self, interaction: Interaction, button: Button):
+        """Deletes the ticket channel."""
+        channel = interaction.channel
+        if channel.name.startswith("ticket-"):
+            await interaction.response.send_message(f"{EMOJI_IDS['tick']} Closing this ticket in 5 seconds...")
+            await discord.utils.sleep_until(discord.utils.utcnow() + discord.Timedelta(seconds=5))
+            await channel.delete()
+        else:
+            await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
 
-        # ticket open embed
-        emoji_tick = get_custom_emoji_str(guild, "tick")
-        embed = discord.Embed(title="🎫 Ticket Created",
-                              description=(f"{emoji_tick} {author.mention}, your ticket has been opened. "
-                                           "Please describe your issue and a staff member will assist you shortly."),
-                              color=discord.Color.blurple())
-        # Close button view (for staff)
-        close_view = TicketCloseView(owner_id=author.id)
-        try:
-            await channel.send(content=f"{author.mention}", embed=embed, view=close_view)
-        except Exception:
-            await channel.send(content=f"{author.mention}", embed=embed)
+@bot.tree.command(name="ticket_panel", description="Sends a ticket creation embed with a button.")
+@app_commands.default_permissions(administrator=True)
+async def ticket_panel(interaction: Interaction):
+    """Sends a ticket panel with a button to create tickets."""
+    if interaction.guild and interaction.guild.name != "EvX Corp":
+        await interaction.response.send_message("This command is only available in the 'EvX Corp' guild.", ephemeral=True)
+        return
 
-        # ack the user
-        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
-        # log creation
-        log_embed = discord.Embed(title="🟢 Ticket Opened",
-                                  description=f"Ticket {channel.mention} opened by {author.mention}",
-                                  color=discord.Color.green())
-        await send_log(guild, log_embed)
+    ticket_embed = Embed(
+        title=f"{interaction.guild.name}™ Ticket System",
+        description="Need help? Click the button below to create a private support ticket.",
+        color=0x00aaff
+    )
+    ticket_embed.set_footer(text="Developed by EvX")
 
-class TicketCloseView(discord.ui.View):
-    def __init__(self, owner_id: int, *, timeout: Optional[float]=None):
-        super().__init__(timeout=timeout)
-        self.owner_id = owner_id
+    view = TicketButton(bot)
+    await interaction.response.send_message(embed=ticket_embed, view=view)
 
-    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # only admins or ticket owner can close
-        is_admin_user = interaction.user.guild_permissions.administrator
-        chan = interaction.channel
-        owner_id = bot.open_tickets.get(chan.id)
-        if not (is_admin_user or interaction.user.id == owner_id):
-            await interaction.response.send_message("❌ Only staff or ticket owner may close this ticket.", ephemeral=True)
-            return
-
-        # archive (delete) channel or rename & lock
-        try:
-            await chan.edit(name=f"closed-{chan.name}", topic=f"Closed by {interaction.user}", reason="Ticket closed")
-            # revoke member view by setting everyone no view
-            await chan.set_permissions(interaction.guild.default_role, view_channel=False)
-            # optionally remove ticket mapping
-            bot.open_tickets.pop(chan.id, None)
-            await chan.send(embed=discord.Embed(title="🔒 Ticket Closed", description=f"Closed by {interaction.user.mention}", color=discord.Color.red()))
-            await send_log(interaction.guild, discord.Embed)
-
+# --- Start the bot ---
 bot.run(TOKEN)
-
