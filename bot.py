@@ -4,6 +4,8 @@ from discord.ext import commands
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("TOKEN")  # set this in Render environment variables
+os.environ["DISCORD_NO_VOICE"] = "true"
+
 
 if not TOKEN:
     raise RuntimeError("TOKEN environment variable not set")
@@ -156,3 +158,4 @@ async def on_ready():
 
 # ---------------- RUN ----------------
 bot.run(TOKEN)
+
