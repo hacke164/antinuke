@@ -1,4 +1,1 @@
-discord.py
-aiosqlite
-python-dotenv
-flask
+discord.py==2.3.2
