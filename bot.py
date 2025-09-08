@@ -316,43 +316,47 @@ async def set_permissions(interaction: Interaction, target: Union[discord.Member
     Note: The 'state' parameter is a string due to Discord API limitations
     and is converted to a boolean inside the function.
     """
-    # Convert the string state to a boolean
-    boolean_state = state == "true"
+    try:
+        # Convert the string state to a boolean
+        boolean_state = state == "true"
 
-    if module == "anti_nuke":
-        features = list(bot.config["anti_nuke"].keys())
-    elif module == "auto_mod":
-        features = list(bot.config["auto_mod"].keys())
-    else:
-        await interaction.response.send_message("Invalid module selected.", ephemeral=True)
-        return
+        if module == "anti_nuke":
+            features = list(bot.config["anti_nuke"].keys())
+        elif module == "auto_mod":
+            features = list(bot.config["auto_mod"].keys())
+        else:
+            await interaction.response.send_message("Invalid module selected.", ephemeral=True)
+            return
 
-    if feature not in features:
-        await interaction.response.send_message(f"Feature '{feature}' not found in module '{module}'.", ephemeral=True)
-        return
+        if feature not in features:
+            await interaction.response.send_message(f"Feature '{feature}' not found in module '{module}'.", ephemeral=True)
+            return
 
-    permissions = bot.config["whitelisted_permissions"]
-    target_id = str(target.id)
+        permissions = bot.config["whitelisted_permissions"]
+        target_id = str(target.id)
 
-    if target_id not in permissions:
-        permissions[target_id] = {"anti_nuke": {}, "auto_mod": {}}
-    
-    permissions[target_id][module][feature] = boolean_state
-    save_config(bot.config)
+        if target_id not in permissions:
+            permissions[target_id] = {"anti_nuke": {}, "auto_mod": {}}
+        
+        permissions[target_id][module][feature] = boolean_state
+        save_config(bot.config)
 
-    action = "enabled" if boolean_state else "disabled"
-    embed = Embed(
-        title="Permissions Updated",
-        description=f"Permissions for {target.mention} have been updated.",
-        color=0x2ecc71
-    )
-    embed.add_field(
-        name=f"{feature.replace('_', ' ').title()}",
-        value=f"**{action.capitalize()}** in the `{module.replace('_', ' ').title()}` module.",
-        inline=False
-    )
-    embed.set_footer(text=f"Action requested by {interaction.user.name}", icon_url=interaction.user.avatar.url)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        action = "enabled" if boolean_state else "disabled"
+        embed = Embed(
+            title="Permissions Updated",
+            description=f"Permissions for {target.mention} have been updated.",
+            color=0x2ecc71
+        )
+        embed.add_field(
+            name=f"{feature.replace('_', ' ').title()}",
+            value=f"**{action.capitalize()}** in the `{module.replace('_', ' ').title()}` module.",
+            inline=False
+        )
+        embed.set_footer(text=f"Action requested by {interaction.user.name}", icon_url=interaction.user.avatar.url)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"An unexpected error occurred in set_permissions: {e}")
+        await interaction.response.send_message("An unexpected error occurred. Please contact the bot developer.", ephemeral=True)
 
 @set_permissions.autocomplete('feature')
 async def feature_autocomplete(interaction: Interaction, current: str):
@@ -375,45 +379,49 @@ async def feature_autocomplete(interaction: Interaction, current: str):
 @app_commands.default_permissions(administrator=True)
 async def list_permissions(interaction: Interaction, target: Union[discord.Member, discord.Role]):
     """Lists all permissions for a member or role."""
-    permissions = bot.config["whitelisted_permissions"]
-    target_id = str(target.id)
+    try:
+        permissions = bot.config["whitelisted_permissions"]
+        target_id = str(target.id)
 
-    if target_id not in permissions or (not permissions[target_id]["anti_nuke"] and not permissions[target_id]["auto_mod"]):
-        await interaction.response.send_message(f"No custom permissions found for {target.mention}.", ephemeral=True)
-        return
+        if target_id not in permissions or (not permissions[target_id].get("anti_nuke") and not permissions[target_id].get("auto_mod")):
+            await interaction.response.send_message(f"No custom permissions found for {target.mention}.", ephemeral=True)
+            return
 
-    embed = Embed(
-        title=f"Whitelisted Permissions for {target.name}",
-        description=f"Showing special permissions for {target.mention}.",
-        color=0x3498db
-    )
-    
-    # Anti-Nuke Permissions
-    antinuke_perms = permissions[target_id].get("anti_nuke", {})
-    antinuke_list = []
-    for feature, state in antinuke_perms.items():
-        status = "✅ Enabled" if state else "❌ Disabled"
-        antinuke_list.append(f"`{feature.replace('_', ' ').title()}`: {status}")
-    embed.add_field(
-        name="Anti-Nuke Permissions",
-        value="\n".join(antinuke_list) if antinuke_list else "No custom permissions set.",
-        inline=False
-    )
+        embed = Embed(
+            title=f"Whitelisted Permissions for {target.name}",
+            description=f"Showing special permissions for {target.mention}.",
+            color=0x3498db
+        )
+        
+        # Anti-Nuke Permissions
+        antinuke_perms = permissions[target_id].get("anti_nuke", {})
+        antinuke_list = []
+        for feature, state in antinuke_perms.items():
+            status = "✅ Enabled" if state else "❌ Disabled"
+            antinuke_list.append(f"`{feature.replace('_', ' ').title()}`: {status}")
+        embed.add_field(
+            name="Anti-Nuke Permissions",
+            value="\n".join(antinuke_list) if antinuke_list else "No custom permissions set.",
+            inline=False
+        )
 
-    # Auto-Mod Permissions
-    automod_perms = permissions[target_id].get("auto_mod", {})
-    automod_list = []
-    for feature, state in automod_perms.items():
-        status = "✅ Enabled" if state else "❌ Disabled"
-        automod_list.append(f"`{feature.replace('_', ' ').title()}`: {status}")
-    embed.add_field(
-        name="Auto-Mod Permissions",
-        value="\n".join(automod_list) if automod_list else "No custom permissions set.",
-        inline=False
-    )
-    
-    embed.set_footer(text=f"Requested by {interaction.user.name}", icon_url=interaction.user.avatar.url)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        # Auto-Mod Permissions
+        automod_perms = permissions[target_id].get("auto_mod", {})
+        automod_list = []
+        for feature, state in automod_perms.items():
+            status = "✅ Enabled" if state else "❌ Disabled"
+            automod_list.append(f"`{feature.replace('_', ' ').title()}`: {status}")
+        embed.add_field(
+            name="Auto-Mod Permissions",
+            value="\n".join(automod_list) if automod_list else "No custom permissions set.",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Requested by {interaction.user.name}", icon_url=interaction.user.avatar.url)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"An unexpected error occurred in list_permissions: {e}")
+        await interaction.response.send_message("An unexpected error occurred. Please contact the bot developer.", ephemeral=True)
 
 
 # --- Embed Creation Commands ---
