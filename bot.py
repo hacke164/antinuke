@@ -407,6 +407,7 @@ class TicketCloseView(discord.ui.View):
             # optionally remove ticket mapping
             bot.open_tickets.pop(chan.id, None)
             await chan.send(embed=discord.Embed(title="🔒 Ticket Closed", description=f"Closed by {interaction.user.mention}", color=discord.Color.red()))
-            await send_log(interaction.guild, discord.Embed
+            await send_log(interaction.guild, discord.Embed)
 
 bot.run(TOKEN)
+
