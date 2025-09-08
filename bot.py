@@ -3,11 +3,7 @@
 
 import os
 import discord
-from dotenv import load_dotenv
 import asyncio
-
-# Load environment variables from a .env file for local testing.
-load_dotenv()
 
 # Define the bot's intents. This is crucial for receiving certain events.
 # We need more intents now for the new event listeners.
