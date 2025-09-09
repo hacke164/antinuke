@@ -4,14 +4,13 @@ import json
 import threading
 from typing import Dict, Any, Optional, List
 
+from flask import Flask
 import discord
 from discord import app_commands
 from discord.ext import commands
 from discord.utils import utcnow
 
-# ---- KEEP ALIVE WEB SERVER ----
-from flask import Flask
-
+# ---------------- KEEP ALIVE WEB SERVER ----------------
 app = Flask('')
 
 @app.route('/')
@@ -22,7 +21,7 @@ def run_web():
     app.run(host='0.0.0.0', port=8080)
 
 def keep_alive():
-    t = threading.Thread(target=run_web)
+    t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
 
@@ -96,7 +95,7 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "antinuke": {feat: False for feat in ANTINUKE_FEATURES},
             "responses": {act: False for act in RESPONSE_ACTIONS},
             "automod": {feat: False for feat in AUTOMOD_FEATURES},
-            "whitelist_users": [],  # store as strings
+            "whitelist_users": [],
             "whitelist_roles": [],
             "locked": False,
             "mass_mention_threshold": 5,
@@ -121,7 +120,6 @@ def build_guard_embed(guild: discord.Guild, guild_settings: Dict[str, Any]) -> d
             e.set_author(name=guild.name, icon_url=guild.icon.url)
         except Exception:
             e.set_author(name=guild.name)
-    # bot thumbnail
     try:
         e.set_thumbnail(url=bot.user.display_avatar.url)
     except Exception:
@@ -152,7 +150,6 @@ def build_guard_embed(guild: discord.Guild, guild_settings: Dict[str, Any]) -> d
 
 
 async def is_whitelisted(guild_settings: Dict[str, Any], member: discord.Member) -> bool:
-    # admins auto-whitelisted
     try:
         if member.guild_permissions.administrator:
             return True
@@ -167,10 +164,6 @@ async def is_whitelisted(guild_settings: Dict[str, Any], member: discord.Member)
 
 
 async def apply_responses(guild: discord.Guild, executor: discord.Member, reason: str, guild_settings: Dict[str, Any]) -> List[str]:
-    """
-    Apply configured response actions to executor.
-    Returns a list of results for logging.
-    """
     results: List[str] = []
     try:
         if await is_whitelisted(guild_settings, executor):
@@ -215,7 +208,7 @@ async def apply_responses(guild: discord.Guild, executor: discord.Member, reason
         except Exception as e:
             results.append(f"notify_failed:{e}")
 
-    # server_lockdown (set permission overwrite for @everyone in all text channels)
+    # server_lockdown
     if guild_settings["responses"].get("server_lockdown"):
         try:
             if not guild_settings.get("locked"):
@@ -239,11 +232,11 @@ async def apply_responses(guild: discord.Guild, executor: discord.Member, reason
         except Exception as e:
             results.append(f"server_lock_failed:{e}")
 
-    # unverified_ban - example: ban accounts younger than 5 minutes (placeholder logic)
+    # unverified_ban (example: ban accounts younger than 7 days)
     if guild_settings["responses"].get("unverified_ban"):
         try:
             created = executor.created_at
-            if (utcnow() - created).total_seconds() < 60 * 60 * 24 * 7:  # e.g., account < 7 days
+            if (utcnow() - created).total_seconds() < 60 * 60 * 24 * 7:
                 try:
                     await guild.ban(executor, reason="Guardian: unverified/new account")
                     results.append("unverified_banned")
@@ -258,18 +251,13 @@ async def apply_responses(guild: discord.Guild, executor: discord.Member, reason
 
 # ---------------- Audit log helper ----------------
 async def check_executor_from_audit(guild: discord.Guild, action: discord.AuditLogAction, target_id: Optional[int] = None, lookback_seconds: int = 8) -> Optional[discord.User]:
-    """
-    Try to find the executor of an audit log action. Returns a discord.User/Member or None.
-    """
     try:
-        async for entry in guild.audit_logs(limit=10, action=action):
-            # If we can match target id, prefer it
+        async for entry in guild.audit_logs(limit=12, action=action):
             try:
                 if target_id and getattr(entry.target, "id", None) == int(target_id):
                     return entry.user
             except Exception:
                 pass
-            # fallback: if very recent
             if (utcnow() - entry.created_at).total_seconds() <= lookback_seconds:
                 return entry.user
     except Exception:
@@ -284,88 +272,71 @@ class GuardView(discord.ui.View):
         self.guild = guild
         self.guild_settings = guild_settings
 
-        # Put Antinuke toggles first
+        # Antinuke toggles
         for feat in ANTINUKE_FEATURES:
-            self.add_item(ToggleButton("antinuke", feat, guild_settings))
+            enabled = guild_settings["antinuke"].get(feat, False)
+            b = discord.ui.Button(label=feat, style=discord.ButtonStyle.green if enabled else discord.ButtonStyle.danger, custom_id=f"antinuke:{feat}")
+            b.callback = self.make_toggle_callback(feat, "antinuke")
+            self.add_item(b)
 
-        # Response actions
+        # Response action toggles
         for act in RESPONSE_ACTIONS:
-            self.add_item(ToggleButton("responses", act, guild_settings))
+            enabled = guild_settings["responses"].get(act, False)
+            b = discord.ui.Button(label=act, style=discord.ButtonStyle.green if enabled else discord.ButtonStyle.secondary, custom_id=f"response:{act}")
+            b.callback = self.make_toggle_callback(act, "responses")
+            self.add_item(b)
 
         # Automod toggles
         for feat in AUTOMOD_FEATURES:
-            self.add_item(ToggleButton("automod", feat, guild_settings))
+            enabled = guild_settings["automod"].get(feat, False)
+            b = discord.ui.Button(label=feat, style=discord.ButtonStyle.green if enabled else discord.ButtonStyle.danger, custom_id=f"automod:{feat}")
+            b.callback = self.make_toggle_callback(feat, "automod")
+            self.add_item(b)
 
-        # Whitelist editor + Save button at end
-        self.add_item(WhitelistButton(guild_settings))
-        self.add_item(SaveButton(guild_settings))
+        # Whitelist editor button
+        wb = discord.ui.Button(label="Edit Whitelist", style=discord.ButtonStyle.gray, custom_id="whitelist:open")
+        wb.callback = self.whitelist_callback
+        self.add_item(wb)
 
+        # Save / Update button
+        sb = discord.ui.Button(label="Save / Update", style=discord.ButtonStyle.blurple, custom_id="guardian:save")
+        sb.callback = self.save_callback
+        self.add_item(sb)
 
-class ToggleButton(discord.ui.Button):
-    def __init__(self, category: str, key: str, guild_settings: Dict[str, Any]):
-        self.category = category
-        self.key = key
-        self.guild_settings = guild_settings
-        enabled = guild_settings.get(category, {}).get(key, False)
-        label = key
-        style = discord.ButtonStyle.green if enabled else discord.ButtonStyle.danger
-        super().__init__(label=label, style=style)
-
-    async def callback(self, interaction: discord.Interaction):
-        # Only admins allowed
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only administrators can change settings.", ephemeral=True)
-            return
-
-        # Toggle the setting
-        current = self.guild_settings[self.category].get(self.key, False)
-        self.guild_settings[self.category][self.key] = not current
-        save_settings(settings)
-
-        # Update this button's style
-        self.style = discord.ButtonStyle.green if not current else discord.ButtonStyle.danger
-
-        # Edit the original message in-place with updated embed and full view (so all button colors persist)
-        try:
+    def make_toggle_callback(self, key: str, category: str):
+        async def callback(interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("Only administrators can toggle settings.", ephemeral=True)
+                return
+            current = self.guild_settings[category].get(key, False)
+            self.guild_settings[category][key] = not current
+            save_settings(settings)
+            # rebuild embed & update view (so all buttons reflect current states)
             embed = build_guard_embed(interaction.guild, self.guild_settings)
-            await interaction.response.edit_message(embed=embed, view=self.view)
-        except Exception:
-            # fallback ephemeral confirmation
-            await interaction.response.send_message(f"Toggled `{self.key}` to {'ON' if not current else 'OFF'}. (Could not update panel visually)", ephemeral=True)
+            # create a fresh view with updated styles
+            view = GuardView(interaction.guild, self.guild_settings)
+            await interaction.response.edit_message(embed=embed, view=view)
+        return callback
 
+    async def whitelist_callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only administrators can edit whitelist.", ephemeral=True)
+            return
+        modal = WhitelistModal(self.guild_settings)
+        await interaction.response.send_modal(modal)
 
-class SaveButton(discord.ui.Button):
-    def __init__(self, guild_settings: Dict[str, Any]):
-        self.guild_settings = guild_settings
-        super().__init__(label="Save / Update", style=discord.ButtonStyle.blurple)
-
-    async def callback(self, interaction: discord.Interaction):
+    async def save_callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("Only administrators can save settings.", ephemeral=True)
             return
         save_settings(settings)
         embed = build_guard_embed(interaction.guild, self.guild_settings)
-        try:
-            await interaction.response.edit_message(embed=embed, view=self.view)
-        except Exception:
-            await interaction.response.send_message("Settings saved.", ephemeral=True)
-
-
-class WhitelistButton(discord.ui.Button):
-    def __init__(self, guild_settings: Dict[str, Any]):
-        self.guild_settings = guild_settings
-        super().__init__(label="Edit Whitelist", style=discord.ButtonStyle.secondary)
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only administrators can edit the whitelist.", ephemeral=True)
-            return
-        modal = WhitelistModal(self.guild_settings)
-        await interaction.response.send_modal(modal)
+        view = GuardView(interaction.guild, self.guild_settings)
+        await interaction.response.edit_message(embed=embed, view=view)
 
 
 class WhitelistModal(discord.ui.Modal, title="Modify Whitelist"):
-    user_or_role = discord.ui.TextInput(label="User ID or Role ID", placeholder="Enter ID", required=True)
+    user_or_role = discord.ui.TextInput(label="User ID or Role ID", placeholder="Enter numeric ID", required=True)
     action = discord.ui.TextInput(label="Action", placeholder="add/remove", required=True)
 
     def __init__(self, guild_settings: Dict[str, Any]):
@@ -379,20 +350,19 @@ class WhitelistModal(discord.ui.Modal, title="Modify Whitelist"):
             await interaction.response.send_message("ID must be numeric.", ephemeral=True)
             return
         id_str = str(value)
-
         if action == "add":
             if id_str not in self.guild_settings["whitelist_users"]:
                 self.guild_settings["whitelist_users"].append(id_str)
             await interaction.response.send_message(f"Added {id_str} to whitelist (users). Click Save / Update to refresh panel.", ephemeral=True)
         elif action == "remove":
             self.guild_settings["whitelist_users"] = [x for x in self.guild_settings["whitelist_users"] if x != id_str]
-            await interaction.response.send_message(f"Removed {id_str} from whitelist (users) if present. Click Save / Update to refresh panel.", ephemeral=True)
+            await interaction.response.send_message(f"Removed {id_str} from whitelist (users). Click Save / Update to refresh panel.", ephemeral=True)
         else:
             await interaction.response.send_message("Action must be add or remove.", ephemeral=True)
         save_settings(settings)
 
 
-# ---------------- Application Commands ----------------
+# ---------------- Commands ----------------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -417,7 +387,7 @@ async def about(interaction: discord.Interaction):
 @bot.tree.command(name="enable_guard", description="Enable Guardian and open the control panel")
 async def enable_guard(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Only administrators can enable or configure the guard.", ephemeral=True)
+        await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     if not interaction.guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
@@ -433,7 +403,7 @@ async def enable_guard(interaction: discord.Interaction):
 @bot.tree.command(name="disable_guard", description="Disable Guardian for this server")
 async def disable_guard(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Only administrators can disable the guard.", ephemeral=True)
+        await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     if not interaction.guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
@@ -456,7 +426,7 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     executor = await check_executor_from_audit(guild, discord.AuditLogAction.channel_delete, target_id=channel.id)
     if not executor:
         return
-    member = guild.get_member(executor.id) or executor
+    member = guild.get_member(executor.id) or None
     if isinstance(member, discord.Member):
         await apply_responses(guild, member, f"Detected channel deleted: {channel.name}", gs)
 
@@ -472,7 +442,7 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
     executor = await check_executor_from_audit(guild, discord.AuditLogAction.channel_create, target_id=channel.id)
     if not executor:
         return
-    member = guild.get_member(executor.id) or executor
+    member = guild.get_member(executor.id) or None
     if isinstance(member, discord.Member):
         await apply_responses(guild, member, f"Detected channel created: {channel.name}", gs)
 
@@ -488,7 +458,7 @@ async def on_guild_role_delete(role: discord.Role):
     executor = await check_executor_from_audit(guild, discord.AuditLogAction.role_delete, target_id=role.id)
     if not executor:
         return
-    member = guild.get_member(executor.id) or executor
+    member = guild.get_member(executor.id) or None
     if isinstance(member, discord.Member):
         await apply_responses(guild, member, f"Detected role deleted: {role.name}", gs)
 
@@ -504,7 +474,7 @@ async def on_guild_role_create(role: discord.Role):
     executor = await check_executor_from_audit(guild, discord.AuditLogAction.role_create, target_id=role.id)
     if not executor:
         return
-    member = guild.get_member(executor.id) or executor
+    member = guild.get_member(executor.id) or None
     if isinstance(member, discord.Member):
         await apply_responses(guild, member, f"Detected role created: {role.name}", gs)
 
@@ -520,7 +490,7 @@ async def on_webhooks_update(channel: discord.abc.GuildChannel):
     executor = await check_executor_from_audit(guild, discord.AuditLogAction.webhook_create)
     if not executor:
         return
-    member = guild.get_member(executor.id) or executor
+    member = guild.get_member(executor.id) or None
     if isinstance(member, discord.Member):
         await apply_responses(guild, member, f"Detected webhook change in {channel.name}", gs)
 
@@ -535,16 +505,13 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     executor = await check_executor_from_audit(guild, discord.AuditLogAction.ban, target_id=user.id)
     if not executor:
         return
-    member = guild.get_member(executor.id) or executor
+    member = guild.get_member(executor.id) or None
     if isinstance(member, discord.Member):
         await apply_responses(guild, member, f"Detected ban of {user}", gs)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    """
-    Could be voluntary leave or a kick. If kicks are enabled, look up the audit log for a recent kick.
-    """
     guild = member.guild
     gs = get_guild_settings(guild.id)
     if not gs.get("enabled"):
@@ -554,7 +521,7 @@ async def on_member_remove(member: discord.Member):
     executor = await check_executor_from_audit(guild, discord.AuditLogAction.kick, target_id=member.id)
     if not executor:
         return
-    member_exec = guild.get_member(executor.id) or executor
+    member_exec = guild.get_member(executor.id) or None
     if isinstance(member_exec, discord.Member):
         await apply_responses(guild, member_exec, f"Detected kick of {member}", gs)
 
@@ -571,7 +538,7 @@ async def on_member_join(member: discord.Member):
         executor = await check_executor_from_audit(guild, discord.AuditLogAction.bot_add, target_id=member.id)
         if not executor:
             return
-        member_exec = guild.get_member(executor.id) or executor
+        member_exec = guild.get_member(executor.id) or None
         if isinstance(member_exec, discord.Member):
             await apply_responses(guild, member_exec, f"Detected bot added {member}", gs)
 
@@ -595,7 +562,6 @@ async def on_message(message: discord.Message):
                 await message.delete()
             except Exception:
                 pass
-            # apply responses (ban/kick/remove roles/notify)
             try:
                 author_member = message.guild.get_member(message.author.id)
                 if author_member:
@@ -623,8 +589,7 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-# --------------- Start ---------------
+# --------------- Run ---------------
 if __name__ == "__main__":
-    keep_alive()   # start Flask webserver
+    keep_alive()
     bot.run(TOKEN)
-
