@@ -1,15 +1,19 @@
 # bot.py
 import os
-os.environ["DISCORD_NO_VOICE"] = "true"  # Disable voice/audio to prevent audioop import issues
+import json
+from typing import Dict, Any, Optional
 
 import discord
-from discord.ext import commands
 from discord import app_commands
-import asyncio
+from discord.ext import commands
+from discord.utils import utcnow
 
 # ---------------- CONFIG ----------------
-TOKEN = os.environ.get("DISCORD_TOKEN")  # Add in Render env vars
-DEFAULT_LOG_CHANNEL_NAME = "evx-guard-logs"
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("TOKEN environment variable not set.")
+
+SETTINGS_FILE = "guild_settings.json"
 
 # ---------------- INTENTS ----------------
 intents = discord.Intents.default()
@@ -17,237 +21,245 @@ intents.guilds = True
 intents.members = True
 intents.messages = True
 intents.message_content = True
-intents.emojis_and_stickers = True
-intents.bans = True
-intents.guild_reactions = True
-intents.webhooks = True
-intents.invites = True
 
-# ---------------- BOT INIT ----------------
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------------- GLOBAL DATA ----------------
-features = {
-    "Antinuke": {
-        "Ban": False,
-        "Kick": False,
-        "Prune": False,
-        "Bot Add": False,
-        "Server Update": False,
-        "Member Role Update": False,
-        "Channel Create": False,
-        "Channel Delete": False,
-        "Channel Update": False,
-        "Role Create": False,
-        "Role Delete": False,
-        "Role Update": False,
-        "Mention @everyone": False,
-        "Webhook Management": False,
-        "Emojis & Stickers Management": False
-    },
-    "Automod": {
-        "Bad Words Filter": False,
-        "Link Filter": False,
-        "Invite Filter": False,
-        "Caps Filter": False,
-        "Spam Filter": False,
-        "Mention Spam Filter": False,
-        "Image Filter": False,
-        "Emoji Filter": False,
-        "Sticker Filter": False,
-        "Swear Jar": False
-    }
-}
+# ---------------- FEATURES ----------------
+ANTINUKE_FEATURES = [
+    "channels_deleted",
+    "channels_created",
+    "roles_deleted",
+    "roles_created",
+    "webhooks_created",
+    "member_bans",
+    "member_kicks",
+    "bots_added",
+]
 
-whitelist = {}
-BAD_WORDS = ["badword1", "badword2", "swear"]  # Example
+RESPONSE_ACTIONS = [
+    "remove_roles",
+    "kick_member",
+    "ban_member",
+    "server_lockdown",
+    "unverified_ban",
+    "notify_admins",
+]
 
-log_channel = None
+AUTOMOD_FEATURES = [
+    "link_invite_filtering",
+    "mass_mention_protection",
+]
 
-# ---------------- HELPER FUNCTIONS ----------------
-def is_whitelisted(user_id: int, category: str, feature: str):
-    if user_id in whitelist:
-        return feature in whitelist[user_id].get(category.lower(), [])
-    return False
+# ---------------- Persistence helpers ----------------
+def load_settings() -> Dict[str, Any]:
+    if not os.path.exists(SETTINGS_FILE):
+        return {}
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-async def get_audit_log_user(guild: discord.Guild, event_type, target_id):
-    await asyncio.sleep(1)
-    async for entry in guild.audit_logs(limit=5, action=event_type):
-        if entry.target.id == target_id:
-            return entry.user
-    return None
+def save_settings(data: Dict[str, Any]):
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-async def ensure_log_channel(guild: discord.Guild):
-    global log_channel
-    for channel in guild.text_channels:
-        if channel.name == DEFAULT_LOG_CHANNEL_NAME:
-            log_channel = channel
-            return
-    log_channel = await guild.create_text_channel(DEFAULT_LOG_CHANNEL_NAME)
+settings = load_settings()  # dictionary keyed by guild_id (str)
 
-# ---------------- GUARD VIEW ----------------
+
+def get_guild_settings(guild_id: int) -> Dict[str, Any]:
+    gid = str(guild_id)
+    if gid not in settings:
+        settings[gid] = {
+            "enabled": False,
+            "antinuke": {feat: False for feat in ANTINUKE_FEATURES},
+            "responses": {act: False for act in RESPONSE_ACTIONS},
+            "automod": {feat: False for feat in AUTOMOD_FEATURES},
+            "whitelist_users": [],
+            "whitelist_roles": [],
+            "locked": False,
+            "mass_mention_threshold": 5,
+        }
+        save_settings(settings)
+    return settings[gid]
+
+
+# ---------------- Utilities ----------------
+def format_feature_line(name: str, enabled: bool) -> str:
+    mark = "✅" if enabled else "❌"
+    return f"{mark} `{name}`"
+
+def build_guard_embed(guild: discord.Guild, guild_settings: Dict[str, Any]) -> discord.Embed:
+    e = discord.Embed(
+        title=f"{guild.name} — Guardian Settings",
+        description="Antinuke & AutoMod control panel",
+        color=0x2F3136,
+    )
+    if guild.icon:
+        e.set_author(name=guild.name, icon_url=guild.icon.url)
+    e.set_thumbnail(url=bot.user.display_avatar.url)
+
+    e.add_field(
+        name="Antinuke",
+        value="\n".join([format_feature_line(k, guild_settings["antinuke"].get(k, False)) for k in ANTINUKE_FEATURES]),
+        inline=False,
+    )
+    e.add_field(
+        name="Response Actions",
+        value="\n".join([format_feature_line(k, guild_settings["responses"].get(k, False)) for k in RESPONSE_ACTIONS]),
+        inline=False,
+    )
+    e.add_field(
+        name="AutoMod",
+        value="\n".join([format_feature_line(k, guild_settings["automod"].get(k, False)) for k in AUTOMOD_FEATURES]),
+        inline=False,
+    )
+    e.add_field(
+        name="Whitelist",
+        value=f"Users: {', '.join(guild_settings.get('whitelist_users', [])) or 'None'}\nRoles: {', '.join(guild_settings.get('whitelist_roles', [])) or 'None'}",
+        inline=False,
+    )
+    e.set_footer(text="Click the buttons below to toggle each option. Only admins can change settings.")
+    return e
+
+
+# ---------------- UI Components ----------------
 class GuardView(discord.ui.View):
-    def __init__(self, bot):
+    def __init__(self, guild: discord.Guild, guild_settings: Dict[str, Any]):
         super().__init__(timeout=None)
-        self.bot = bot
-        self.selected_user = None
-        self.selected_antinuke_features = []
-        self.selected_automod_features = []
+        self.guild = guild
+        self.guild_settings = guild_settings
 
-        self.add_item(self.create_antinuke_select())
-        self.add_item(self.create_automod_select())
+        for feat in ANTINUKE_FEATURES:
+            self.add_item(ToggleButton("antinuke", feat, guild_settings))
 
-    def create_antinuke_select(self):
-        options = [discord.SelectOption(label=f, value=f) for f in features["Antinuke"].keys()]
-        select = discord.ui.Select(
-            placeholder="Select Antinuke features...",
-            options=options,
-            min_values=0,
-            max_values=len(options),
-            disabled=True
-        )
-        async def callback(interaction: discord.Interaction):
-            self.selected_antinuke_features = select.values
-            await interaction.response.defer()
-        select.callback = callback
-        return select
+        for act in RESPONSE_ACTIONS:
+            self.add_item(ToggleButton("responses", act, guild_settings))
 
-    def create_automod_select(self):
-        options = [discord.SelectOption(label=f, value=f) for f in features["Automod"].keys()]
-        select = discord.ui.Select(
-            placeholder="Select Automod features...",
-            options=options,
-            min_values=0,
-            max_values=len(options),
-            disabled=True
-        )
-        async def callback(interaction: discord.Interaction):
-            self.selected_automod_features = select.values
-            await interaction.response.defer()
-        select.callback = callback
-        return select
+        for feat in AUTOMOD_FEATURES:
+            self.add_item(ToggleButton("automod", feat, guild_settings))
 
-    def create_embed(self, guild_name, guild_icon_url):
-        embed = discord.Embed(title=f"{guild_name} Guard System", color=discord.Color.blue())
-        if guild_icon_url:
-            embed.set_thumbnail(url=guild_icon_url)
+        self.add_item(WhitelistButton(guild_settings))
+        self.add_item(SaveButton(guild_settings))
 
-        antinuke_text = "\n".join([f"{'✅' if v else '❌'} **{k}**" for k,v in features["Antinuke"].items()])
-        automod_text = "\n".join([f"{'✅' if v else '❌'} **{k}**" for k,v in features["Automod"].items()])
 
-        embed.add_field(name="🛡 Antinuke", value=antinuke_text, inline=True)
-        embed.add_field(name="🔨 Automod", value=automod_text, inline=True)
+class ToggleButton(discord.ui.Button):
+    def __init__(self, category: str, key: str, guild_settings: Dict[str, Any]):
+        self.category = category
+        self.key = key
+        self.guild_settings = guild_settings
+        enabled = guild_settings[category].get(key, False)
+        label = f"{key}"
+        style = discord.ButtonStyle.green if enabled else discord.ButtonStyle.danger
+        super().__init__(label=label, style=style)
 
-        whitelist_text = ""
-        if not whitelist:
-            whitelist_text = "No users whitelisted."
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Admins only.", ephemeral=True)
+            return
+        current = self.guild_settings[self.category].get(self.key, False)
+        self.guild_settings[self.category][self.key] = not current
+        save_settings(settings)
+
+        # update button color
+        self.style = discord.ButtonStyle.green if not current else discord.ButtonStyle.danger
+
+        # rebuild embed
+        embed = build_guard_embed(interaction.guild, self.guild_settings)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+class SaveButton(discord.ui.Button):
+    def __init__(self, guild_settings: Dict[str, Any]):
+        self.guild_settings = guild_settings
+        super().__init__(label="Save / Update", style=discord.ButtonStyle.blurple)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Admins only.", ephemeral=True)
+            return
+        save_settings(settings)
+        embed = build_guard_embed(interaction.guild, self.guild_settings)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class WhitelistButton(discord.ui.Button):
+    def __init__(self, guild_settings: Dict[str, Any]):
+        self.guild_settings = guild_settings
+        super().__init__(label="Edit Whitelist", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Admins only.", ephemeral=True)
+            return
+        modal = WhitelistModal(self.guild_settings)
+        await interaction.response.send_modal(modal)
+
+
+class WhitelistModal(discord.ui.Modal, title="Modify Whitelist"):
+    user_or_role = discord.ui.TextInput(label="User ID or Role ID", placeholder="Enter ID", required=True)
+    action = discord.ui.TextInput(label="Action", placeholder="add/remove", required=True)
+
+    def __init__(self, guild_settings: Dict[str, Any]):
+        super().__init__()
+        self.guild_settings = guild_settings
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = self.user_or_role.value.strip()
+        action = self.action.value.strip().lower()
+        if not value.isdigit():
+            await interaction.response.send_message("ID must be numeric.", ephemeral=True)
+            return
+        id_str = str(value)
+
+        if action == "add":
+            if id_str not in self.guild_settings["whitelist_users"]:
+                self.guild_settings["whitelist_users"].append(id_str)
+            await interaction.response.send_message(f"Added {id_str} to whitelist.", ephemeral=True)
+        elif action == "remove":
+            self.guild_settings["whitelist_users"] = [x for x in self.guild_settings["whitelist_users"] if x != id_str]
+            await interaction.response.send_message(f"Removed {id_str} from whitelist.", ephemeral=True)
         else:
-            for uid, uf in whitelist.items():
-                user = self.bot.get_user(uid)
-                uname = user.name if user else "Unknown"
-                ant_list = ", ".join(uf.get("antinuke", [])) or "None"
-                auto_list = ", ".join(uf.get("automod", [])) or "None"
-                whitelist_text += f"**{uname}**\nAntinuke: {ant_list}\nAutomod: {auto_list}\n\n"
+            await interaction.response.send_message("Action must be add/remove.", ephemeral=True)
 
-        embed.add_field(name="➕ User Whitelist", value=whitelist_text, inline=False)
+        save_settings(settings)
 
-        if self.selected_user:
-            preview = f"**Selected User:** {self.selected_user.mention}\n"
-            preview += f"Antinuke: {', '.join(self.selected_antinuke_features) or 'None'}\n"
-            preview += f"Automod: {', '.join(self.selected_automod_features) or 'None'}"
-            embed.add_field(name="Current Selection", value=preview, inline=False)
 
-        embed.set_footer(text="Powered by EvX Official")
-        return embed
-
-    # ---------------- BUTTONS ----------------
-    @discord.ui.button(label="Toggle Antinuke", style=discord.ButtonStyle.secondary)
-    async def toggle_antinuke(self, button, interaction: discord.Interaction):
-        all_enabled = all(features["Antinuke"].values())
-        for k in features["Antinuke"]:
-            features["Antinuke"][k] = not all_enabled
-        await interaction.response.edit_message(embed=self.create_embed(interaction.guild.name, interaction.guild.icon.url if interaction.guild.icon else None), view=self)
-
-    @discord.ui.button(label="Toggle Automod", style=discord.ButtonStyle.secondary)
-    async def toggle_automod(self, button, interaction: discord.Interaction):
-        all_enabled = all(features["Automod"].values())
-        for k in features["Automod"]:
-            features["Automod"][k] = not all_enabled
-        await interaction.response.edit_message(embed=self.create_embed(interaction.guild.name, interaction.guild.icon.url if interaction.guild.icon else None), view=self)
-
-    @discord.ui.user_select(placeholder="Select user to whitelist")
-    async def select_user(self, select, interaction: discord.Interaction):
-        self.selected_user = select.values[0]
-        for item in self.children:
-            if isinstance(item, discord.ui.Select) and item.placeholder.startswith("Select"):
-                item.disabled = False
-        await interaction.response.edit_message(embed=self.create_embed(interaction.guild.name, interaction.guild.icon.url if interaction.guild.icon else None), view=self)
-
-    @discord.ui.button(label="Whitelist Antinuke", style=discord.ButtonStyle.success)
-    async def whitelist_antinuke(self, button, interaction: discord.Interaction):
-        if not self.selected_user:
-            await interaction.response.send_message("Select a user first.", ephemeral=True)
-            return
-        uid = self.selected_user.id
-        if uid not in whitelist:
-            whitelist[uid] = {"antinuke": [], "automod": []}
-        whitelist[uid]["antinuke"] = self.selected_antinuke_features
-        await interaction.response.edit_message(embed=self.create_embed(interaction.guild.name, interaction.guild.icon.url if interaction.guild.icon else None), view=self)
-
-    @discord.ui.button(label="Whitelist Automod", style=discord.ButtonStyle.success)
-    async def whitelist_automod(self, button, interaction: discord.Interaction):
-        if not self.selected_user:
-            await interaction.response.send_message("Select a user first.", ephemeral=True)
-            return
-        uid = self.selected_user.id
-        if uid not in whitelist:
-            whitelist[uid] = {"antinuke": [], "automod": []}
-        whitelist[uid]["automod"] = self.selected_automod_features
-        await interaction.response.edit_message(embed=self.create_embed(interaction.guild.name, interaction.guild.icon.url if interaction.guild.icon else None), view=self)
-
-# ---------------- EVENTS ----------------
+# ---------------- Commands ----------------
 @bot.event
 async def on_ready():
-    print(f"{bot.user} is online!")
-    bot.add_view(GuardView(bot))
-    for guild in bot.guilds:
-        await ensure_log_channel(guild)
+    print(f"Logged in as {bot.user}")
+    await bot.tree.sync()
 
-@bot.event
-async def on_message(message):
-    if message.author.bot: return
-
-    # Automod Filters
-    if features["Automod"]["Bad Words Filter"] and not is_whitelisted(message.author.id, "automod", "Bad Words Filter"):
-        if any(b in message.content.lower() for b in BAD_WORDS):
-            await message.delete()
-            await message.channel.send(f"{message.author.mention}, that word is not allowed!", delete_after=5)
-
-    if features["Automod"]["Link Filter"] and not is_whitelisted(message.author.id, "automod", "Link Filter"):
-        if "http://" in message.content.lower() or "https://" in message.content.lower():
-            await message.delete()
-            await message.channel.send(f"{message.author.mention}, links are not allowed!", delete_after=5)
-
-# ---------------- SLASH COMMANDS ----------------
-@bot.tree.command(name="enable_guard", description="Enable the server guard system")
-async def enable_guard(interaction: discord.Interaction):
-    view = GuardView(bot)
-    await ensure_log_channel(interaction.guild)
-    embed = view.create_embed(interaction.guild.name, interaction.guild.icon.url if interaction.guild.icon else None)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-@bot.tree.command(name="disable_guard", description="Disable the server guard system")
-async def disable_guard(interaction: discord.Interaction):
-    global features, whitelist
-    for category in features:
-        for feat in features[category]:
-            features[category][feat] = False
-    whitelist.clear()
-    await interaction.response.send_message("Guard system disabled.", ephemeral=True)
-
-@bot.tree.command(name="about", description="Bot info")
+@bot.tree.command(name="about", description="Show Guardian bot info")
 async def about(interaction: discord.Interaction):
-    await interaction.response.send_message("EvX Guard Bot - Antinuke + Automod protection system.", ephemeral=True)
+    e = discord.Embed(
+        title="Guardian — Server Protection",
+        description="Your all-in-one Discord security solution. Guardian Bot provides powerful, customizable protection against raids, spam, and malicious activity to ensure your server remains a safe and welcoming space for all members.",
+        color=0x5865F2,
+    )
+    e.set_footer(text="Guardian Bot")
+    await interaction.response.send_message(embed=e)
 
-# ---------------- RUN ----------------
-bot.run(TOKEN)
+@bot.tree.command(name="enable_guard", description="Enable Guardian and open panel")
+async def enable_guard(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    gs = get_guild_settings(interaction.guild.id)
+    gs["enabled"] = True
+    save_settings(settings)
+    embed = build_guard_embed(interaction.guild, gs)
+    view = GuardView(interaction.guild, gs)
+    await interaction.response.send_message(embed=embed, view=view)
+
+@bot.tree.command(name="disable_guard", description="Disable Guardian for this server")
+async def disable_guard(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    gs = get_guild_settings(interaction.guild.id)
+    gs["enabled"] = False
+    save_settings(settings)
+    await interaction.response.send_message("Guardian disabled.")
+
+# ---------------- Run ----------------
+if __name__ == "__main__":
+    bot.run(TOKEN)
