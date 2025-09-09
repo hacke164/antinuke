@@ -1,12 +1,30 @@
 # bot.py
 import os
 import json
+import threading
 from typing import Dict, Any, Optional, List
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from discord.utils import utcnow
+
+# ---- KEEP ALIVE WEB SERVER ----
+from flask import Flask
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Guardian Bot is running!"
+
+def run_web():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = threading.Thread(target=run_web)
+    t.start()
+
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("TOKEN")
@@ -607,4 +625,6 @@ async def on_message(message: discord.Message):
 
 # --------------- Start ---------------
 if __name__ == "__main__":
+    keep_alive()   # start Flask webserver
     bot.run(TOKEN)
+
