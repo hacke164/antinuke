@@ -1,24 +1,30 @@
-# bot.py
 """
-Guardian Bot — production-ready single-file (UI + backend + keep-alive)
+Guardian Bot — Full production-ready single-file
+
+Features:
 - Slash commands: /about, /enable_guard, /disable_guard, /set_log_channel
-- Interactive embed UI + toggles via buttons, whitelist modal
-- Antinuke & AutoMod protections with safe punishments, rate-limits, logging
-- Persistent JSON config (atomic + async via aiofiles)
-- Built-in Flask keep-alive endpoint for UptimeRobot (runs in background thread)
+- Persistent JSON config (config.json) stored atomically (aiofiles)
+- Embed-based persistent control panel message (admins only)
+- Antinuke protections (channels/roles/webhooks create/delete, member bans/kicks, bots added)
+- AutoMod protections (link/invite filtering, mass-mention protection)
+- Safe punishments: remove roles, kick, ban, lockdown, unverified account ban, notify admins
+- Per-guild whitelist (antinuke and automod)
+- Rate-limiting for triggers
+- Uses interaction.defer + followup to avoid "Unknown interaction"
+- Flask keep-alive endpoint for Render / UptimeRobot
 - No audioop dependency
 Run:
-  export TOKEN="your_bot_token_here"
+  export TOKEN="your_bot_token"
   python bot.py
 """
 
 import os
+import re
 import json
 import asyncio
 import datetime
 import threading
-import re
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 import aiofiles
 import discord
@@ -26,32 +32,21 @@ from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify
 
-### ---------------- CONFIG ---------------- ###
-DATA_FILE = "data.json"
+# ---------------- CONFIG ----------------
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
-    raise RuntimeError("Set the TOKEN environment variable before running the bot.")
+    raise RuntimeError("Set TOKEN environment variable with your bot token")
 
-BOT_LOGO_URL = "https://i.imgur.com/4M34hi2.png"  # replace with your logo URL if desired
+CONFIG_FILE = "config.json"
+BOT_LOGO_URL = os.getenv("BOT_LOGO_URL", "https://i.imgur.com/4M34hi2.png")
 EMBED_COLOR = discord.Color.blurple()
-KEEP_ALIVE_PORT = int(os.getenv("KEEP_ALIVE_PORT", "8080"))  # Render exposes a port
+KEEP_ALIVE_PORT = int(os.getenv("PORT", os.getenv("KEEP_ALIVE_PORT", "8080")))
 
-### ---------------- INTENTS ---------------- ###
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.messages = True
-intents.message_content = True  # needed for automod message scanning
-
-### ---------------- GLOBALS ---------------- ###
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
-
-_db_lock = asyncio.Lock()
-_db: Dict[str, Any] = {}  # guild_id -> settings
-
+# Defaults for a guild
 DEFAULT_GUILD_SETTINGS = {
     "guard_enabled": False,
+    "panel_message": None,  # "channelid:messageid"
+    "log_channel_id": None,
     "antinuke": {
         "channels_deleted": False,
         "channels_created": False,
@@ -76,51 +71,69 @@ DEFAULT_GUILD_SETTINGS = {
         "mass_mention_threshold": 5
     },
     "whitelist": {
-        "antinuke": [],
+        "antinuke": [],  # list of id strings
         "automod": []
     },
-    "log_channel_id": None,
     "recent_triggers": {}
 }
 
-### ---------------- PERSISTENCE ---------------- ###
-async def load_db():
+# ---------------- PERSISTENCE (async safe) ----------------
+_db_lock = asyncio.Lock()
+_db: Dict[str, Any] = {}
+
+
+async def load_config() -> None:
     global _db
-    if not os.path.exists(DATA_FILE):
+    if not os.path.exists(CONFIG_FILE):
         _db = {}
         return
     async with _db_lock:
         try:
-            async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
+            async with aiofiles.open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 text = await f.read()
                 _db = json.loads(text) if text else {}
         except Exception:
             _db = {}
 
 
-async def save_db():
+async def save_config() -> None:
     async with _db_lock:
-        tmp = DATA_FILE + ".tmp"
+        tmp = CONFIG_FILE + ".tmp"
         try:
             async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(_db, indent=2))
-            os.replace(tmp, DATA_FILE)
+            os.replace(tmp, CONFIG_FILE)
         except Exception as e:
-            print("Failed saving DB:", e)
+            print("Failed to save config:", e)
 
 
-def ensure_guild(guild_id: int):
+def ensure_guild_data(guild_id: int) -> None:
     sid = str(guild_id)
     if sid not in _db:
+        # deep copy default
         _db[sid] = json.loads(json.dumps(DEFAULT_GUILD_SETTINGS))
 
 
-### ---------------- HELPERS ---------------- ###
-def tick(v: bool) -> str:
+# ---------------- BOT INIT ----------------
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.messages = True
+intents.message_content = True  # required for automod scanning
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+
+# ---------------- HELPERS ----------------
+def utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def bool_mark(v: bool) -> str:
     return "✅" if v else "❌"
 
 
-async def send_log_embed(guild: discord.Guild, embed: discord.Embed, settings: Dict[str, Any]):
+async def send_log_embed(guild: discord.Guild, embed: discord.Embed, settings: Dict[str, Any]) -> None:
     cid = settings.get("log_channel_id")
     if cid:
         ch = guild.get_channel(cid)
@@ -150,10 +163,12 @@ async def send_log_embed(guild: discord.Guild, embed: discord.Embed, settings: D
 
 
 def is_whitelisted(settings: Dict[str, Any], category: str, member: discord.Member) -> bool:
-    # Owner and administrators implicitly whitelisted
+    # implicit whitelist for owner and admins
     if member == member.guild.owner or member.guild_permissions.administrator:
         return True
     wl = settings.get("whitelist", {}).get(category, [])
+    if not wl:
+        return False
     s = str(member.id)
     if s in wl:
         return True
@@ -164,7 +179,7 @@ def is_whitelisted(settings: Dict[str, Any], category: str, member: discord.Memb
 
 
 def rate_limit_allows(settings: Dict[str, Any], key: str, window_seconds: int = 10, limit: int = 3) -> bool:
-    now = datetime.datetime.utcnow().timestamp()
+    now = utc_now().timestamp()
     rt = settings.setdefault("recent_triggers", {})
     arr = rt.get(key, [])
     arr = [t for t in arr if now - t < window_seconds]
@@ -188,20 +203,34 @@ async def fetch_audit_actor(guild: discord.Guild, action: discord.AuditLogAction
     return None
 
 
-### ---------------- EMBED + UI BUILDERS ---------------- ###
+def parse_panel_loc(stored: Optional[str]) -> Optional[Tuple[int, int]]:
+    if not stored:
+        return None
+    try:
+        ch, m = stored.split(":")
+        return int(ch), int(m)
+    except Exception:
+        return None
+
+
+def store_panel_loc(channel_id: int, message_id: int) -> str:
+    return f"{channel_id}:{message_id}"
+
+
+# ---------------- EMBED + UI BUILDERS ----------------
 def build_guard_embed(guild: Optional[discord.Guild], settings: Dict[str, Any]) -> discord.Embed:
     name = guild.name if guild else "Server"
     embed = discord.Embed(
-        title=f"{name} • Guardian Protection",
-        description="Premium protection controls — toggle features using the buttons below.\n\n"
-                    "Be careful with auto punishments. Test in a private server first.",
+        title=f"{name} • Guardian",
+        description="Premium protection controls — toggle features with the buttons below.\n"
+                    "Test settings on a private server before enabling auto punishments.",
         color=EMBED_COLOR,
-        timestamp=datetime.datetime.utcnow()
+        timestamp=utc_now()
     )
     if guild and guild.icon:
         embed.set_author(name=name, icon_url=str(guild.icon.url))
-    embed.set_thumbnail(url=BOT_LOGO_URL or (bot.user.avatar.url if bot.user.avatar else None))
-
+    embed.set_thumbnail(url=BOT_LOGO_URL)
+    # Antinuke
     ant = settings.get("antinuke", {})
     ant_text = ""
     keys = [
@@ -215,44 +244,52 @@ def build_guard_embed(guild: Optional[discord.Guild], settings: Dict[str, Any]) 
         ("bots_added", "Bots added"),
     ]
     for k, label in keys:
-        ant_text += f"{tick(bool(ant.get(k, False)))} {label}\n"
-    ant_text += "\n**Response actions:**\n"
+        ant_text += f"{bool_mark(bool(ant.get(k, False)))} {label}\n"
+    ant_text += "\n**Response actions**\n"
     for k in ["remove_roles", "kick_member", "ban_member", "server_lockdown", "unverified_ban", "notify_admins"]:
-        ant_text += f"{tick(bool(ant.get('actions', {}).get(k, False)))} {k}\n"
+        ant_text += f"{bool_mark(bool(ant.get('actions', {}).get(k, False)))} {k}\n"
     embed.add_field(name="🛡 Antinuke", value=ant_text, inline=False)
-
+    # Automod
     am = settings.get("automod", {})
-    am_text = f"{tick(bool(am.get('link_invite_filter', False)))} Link & Invite Filtering\n"
-    am_text += f"{tick(bool(am.get('mass_mention_protection', False)))} Mass Mention/Ping Protection (threshold {am.get('mass_mention_threshold', 5)})\n"
+    am_text = f"{bool_mark(bool(am.get('link_invite_filter', False)))} Link & Invite Filtering\n"
+    am_text += f"{bool_mark(bool(am.get('mass_mention_protection', False)))} Mass Mention Protection (threshold {am.get('mass_mention_threshold', 5)})\n"
     embed.add_field(name="🤖 AutoMod", value=am_text, inline=False)
-
+    # Whitelist
     wl = settings.get("whitelist", {})
-    embed.add_field(name="📜 Whitelist", value=f"Antinuke: {len(wl.get('antinuke', []))} entries\nAutoMod: {len(wl.get('automod', []))} entries", inline=False)
-    embed.set_footer(text="Click toggles below to change settings — admins only.")
+    ant_wl = wl.get("antinuke", [])
+    am_wl = wl.get("automod", [])
+    embed.add_field(name="📜 Whitelist", value=f"Antinuke: {len(ant_wl)} entries\nAutoMod: {len(am_wl)} entries", inline=False)
+    embed.set_footer(text="Buttons below toggle features. Admins only.")
     return embed
 
 
+# Button & modal labels must be <= 45 chars
 class ToggleButton(discord.ui.Button):
-    def __init__(self, guild_id: int, key_path: List[str], label: Optional[str] = None):
-        super().__init__(style=discord.ButtonStyle.secondary, label=label or key_path[-1], custom_id=f"toggle:{guild_id}:{':'.join(key_path)}")
+    def __init__(self, label: str, guild_id: int, key_path: List[str]):
+        # key_path e.g. ["antinuke","channels_deleted"]
+        custom_id = f"toggle:{guild_id}:{':'.join(key_path)}"
+        super().__init__(style=discord.ButtonStyle.secondary, label=(label[:45]), custom_id=custom_id)
         self.guild_id = guild_id
         self.key_path = key_path
 
     async def callback(self, interaction: discord.Interaction):
+        # require admin
         if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You must be a server administrator to modify settings.", ephemeral=True)
+            await interaction.response.send_message("Administrator permissions required.", ephemeral=True)
             return
         sid = str(self.guild_id)
-        ensure_guild(self.guild_id)
+        ensure_guild_data(self.guild_id)
         settings = _db[sid]
         obj = settings
         for k in self.key_path[:-1]:
             obj = obj.setdefault(k, {})
         last = self.key_path[-1]
         obj[last] = not bool(obj.get(last, False))
-        await save_db()
-        # refresh embed & view
-        await interaction.message.edit(embed=build_guard_embed(interaction.guild, settings), view=build_guard_view(self.guild_id))
+        await save_config()
+        # refresh panel if exists
+        guild = interaction.guild
+        await refresh_panel_message(guild, sid)
+        # reply quickly
         await interaction.response.send_message(f"Toggled `{last}` → {obj[last]}", ephemeral=True)
 
 
@@ -263,29 +300,16 @@ class SaveButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You must be a server administrator.", ephemeral=True)
+            await interaction.response.send_message("Administrator permissions required.", ephemeral=True)
             return
-        # saved live already
+        await save_config()
+        await refresh_panel_message(interaction.guild, str(interaction.guild.id))
         await interaction.response.send_message("Settings saved and applied.", ephemeral=True)
 
 
-class ManageWhitelistButton(discord.ui.Button):
-    def __init__(self, guild_id: int):
-        super().__init__(style=discord.ButtonStyle.primary, label="Manage Whitelist", custom_id=f"wl:{guild_id}")
-        self.guild_id = guild_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You must be a server administrator.", ephemeral=True)
-            return
-        # show modal for add/remove
-        modal = WhitelistModal(self.guild_id)
-        await interaction.response.send_modal(modal)
-
-
-class WhitelistModal(discord.ui.Modal, title="Manage Whitelist (add/remove)"):
+class WhitelistModal(discord.ui.Modal, title="Manage Whitelist"):
     category = discord.ui.TextInput(label="Category (antinuke/automod)", placeholder="antinuke", required=True, max_length=20)
-    entry = discord.ui.TextInput(label="Mention or ID (e.g., @user or @role or 123...)", placeholder="@user", required=True, max_length=100)
+    entry = discord.ui.TextInput(label="Mention or ID", placeholder="@user or @role or 123...", required=True, max_length=100)
     action = discord.ui.TextInput(label="Action (add/remove)", placeholder="add", required=True, max_length=10)
 
     def __init__(self, guild_id: int):
@@ -293,8 +317,8 @@ class WhitelistModal(discord.ui.Modal, title="Manage Whitelist (add/remove)"):
         self.guild_id = guild_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Admin permissions required.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Administrator permissions required.", ephemeral=True)
             return
         cat = self.category.value.strip().lower()
         ent = self.entry.value.strip()
@@ -302,7 +326,6 @@ class WhitelistModal(discord.ui.Modal, title="Manage Whitelist (add/remove)"):
         if cat not in ("antinuke", "automod"):
             await interaction.response.send_message("Category must be 'antinuke' or 'automod'.", ephemeral=True)
             return
-        # parse mention or id
         m_user = re.match(r"<@!?(?P<id>\d+)>", ent)
         m_role = re.match(r"<@&(?P<id>\d+)>", ent)
         target_id = None
@@ -313,60 +336,69 @@ class WhitelistModal(discord.ui.Modal, title="Manage Whitelist (add/remove)"):
         elif ent.isdigit():
             target_id = ent
         if not target_id:
-            await interaction.response.send_message("Couldn't parse the mention or ID.", ephemeral=True)
+            await interaction.response.send_message("Couldn't parse mention or ID.", ephemeral=True)
             return
-        ensure_guild(self.guild_id)
-        settings = _db[str(self.guild_id)]
+        sid = str(self.guild_id)
+        ensure_guild_data(self.guild_id)
+        settings = _db[sid]
         wl = settings.setdefault("whitelist", {}).setdefault(cat, [])
         if act == "add":
             if target_id in wl:
                 await interaction.response.send_message("Already whitelisted.", ephemeral=True)
                 return
             wl.append(target_id)
-            await save_db()
+            await save_config()
+            await refresh_panel_message(interaction.guild, sid)
             await interaction.response.send_message("Added to whitelist.", ephemeral=True)
         elif act == "remove":
             if target_id not in wl:
                 await interaction.response.send_message("Not in whitelist.", ephemeral=True)
                 return
             wl.remove(target_id)
-            await save_db()
+            await save_config()
+            await refresh_panel_message(interaction.guild, sid)
             await interaction.response.send_message("Removed from whitelist.", ephemeral=True)
         else:
             await interaction.response.send_message("Action must be 'add' or 'remove'.", ephemeral=True)
 
 
+class ManageWhitelistButton(discord.ui.Button):
+    def __init__(self, guild_id: int):
+        super().__init__(style=discord.ButtonStyle.primary, label="Whitelist Manager", custom_id=f"wl:{guild_id}")
+        self.guild_id = guild_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Administrator permissions required.", ephemeral=True)
+            return
+        modal = WhitelistModal(self.guild_id)
+        await interaction.response.send_modal(modal)
+
+
 class GuardView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=None)
-        # antinuke toggles
-        keys = [
-            ("Channels Deleted", ["antinuke", "channels_deleted"]),
-            ("Channels Created", ["antinuke", "channels_created"]),
-            ("Roles Deleted", ["antinuke", "roles_deleted"]),
-            ("Roles Created", ["antinuke", "roles_created"]),
-            ("Webhooks Created", ["antinuke", "webhooks_created"]),
-            ("Member Bans", ["antinuke", "member_bans"]),
-            ("Member Kicks", ["antinuke", "member_kicks"]),
-            ("Bots Added", ["antinuke", "bots_added"]),
-        ]
-        for lbl, kp in keys:
-            self.add_item(ToggleButton(guild_id, kp, label=lbl))
-        # antinuke actions
-        actions = [
-            ("Remove Roles", ["antinuke", "actions", "remove_roles"]),
-            ("Kick Member", ["antinuke", "actions", "kick_member"]),
-            ("Ban Member", ["antinuke", "actions", "ban_member"]),
-            ("Server Lockdown", ["antinuke", "actions", "server_lockdown"]),
-            ("Unverified Ban", ["antinuke", "actions", "unverified_ban"]),
-            ("Notify Admins", ["antinuke", "actions", "notify_admins"]),
-        ]
-        for lbl, kp in actions:
-            self.add_item(ToggleButton(guild_id, kp, label=lbl))
-        # automod toggles
-        self.add_item(ToggleButton(guild_id, ["automod", "link_invite_filter"], label="Link/Invite Filter"))
-        self.add_item(ToggleButton(guild_id, ["automod", "mass_mention_protection"], label="Mass Mention Protection"))
-        # whitelist and save
+        self.guild_id = guild_id
+        # Antinuke toggles
+        self.add_item(ToggleButton("Channels deleted", guild_id, ["antinuke", "channels_deleted"]))
+        self.add_item(ToggleButton("Channels created", guild_id, ["antinuke", "channels_created"]))
+        self.add_item(ToggleButton("Roles deleted", guild_id, ["antinuke", "roles_deleted"]))
+        self.add_item(ToggleButton("Roles created", guild_id, ["antinuke", "roles_created"]))
+        self.add_item(ToggleButton("Webhooks created", guild_id, ["antinuke", "webhooks_created"]))
+        self.add_item(ToggleButton("Member bans", guild_id, ["antinuke", "member_bans"]))
+        self.add_item(ToggleButton("Member kicks", guild_id, ["antinuke", "member_kicks"]))
+        self.add_item(ToggleButton("Bots added", guild_id, ["antinuke", "bots_added"]))
+        # Actions (sub toggles)
+        self.add_item(ToggleButton("Remove roles (action)", guild_id, ["antinuke", "actions", "remove_roles"]))
+        self.add_item(ToggleButton("Kick member (action)", guild_id, ["antinuke", "actions", "kick_member"]))
+        self.add_item(ToggleButton("Ban member (action)", guild_id, ["antinuke", "actions", "ban_member"]))
+        self.add_item(ToggleButton("Server lockdown", guild_id, ["antinuke", "actions", "server_lockdown"]))
+        self.add_item(ToggleButton("Unverified ban", guild_id, ["antinuke", "actions", "unverified_ban"]))
+        self.add_item(ToggleButton("Notify admins", guild_id, ["antinuke", "actions", "notify_admins"]))
+        # AutoMod
+        self.add_item(ToggleButton("Link/invite filter", guild_id, ["automod", "link_invite_filter"]))
+        self.add_item(ToggleButton("Mass mention protect", guild_id, ["automod", "mass_mention_protection"]))
+        # whitelist manager and save
         self.add_item(ManageWhitelistButton(guild_id))
         self.add_item(SaveButton(guild_id))
 
@@ -375,19 +407,52 @@ def build_guard_view(guild_id: int) -> GuardView:
     return GuardView(guild_id)
 
 
-### ---------------- SLASH COMMANDS ---------------- ###
-def admin_check(interaction: discord.Interaction) -> bool:
+async def refresh_panel_message(guild: discord.Guild, sid: str) -> None:
+    settings = _db.get(sid)
+    if not settings:
+        return
+    panel = settings.get("panel_message")
+    if not panel:
+        return
+    loc = parse_panel_loc(panel)
+    if not loc:
+        return
+    ch_id, msg_id = loc
+    ch = guild.get_channel(ch_id)
+    if not ch:
+        # channel removed; clear panel reference
+        settings["panel_message"] = None
+        await save_config()
+        return
+    try:
+        msg = await ch.fetch_message(msg_id)
+    except Exception:
+        settings["panel_message"] = None
+        await save_config()
+        return
+    embed = build_guard_embed(guild, settings)
+    view = build_guard_view(int(sid))
+    try:
+        await msg.edit(embed=embed, view=view)
+    except discord.HTTPException:
+        # can't edit (maybe deleted); clear panel
+        settings["panel_message"] = None
+        await save_config()
+
+
+# ---------------- SLASH COMMANDS ----------------
+def is_admin(interaction: discord.Interaction) -> bool:
     return isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator
 
 
 @tree.command(name="about", description="About Guardian Bot")
-async def about_cmd(interaction: discord.Interaction):
+async def cmd_about(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Guardian Bot — Server Protector",
         description="Your all-in-one Discord security solution.\n\n"
                     "Guardian Bot provides powerful, customizable protection against raids, spam, and malicious activity.",
         color=EMBED_COLOR,
-        timestamp=datetime.datetime.utcnow()
+        timestamp=utc_now()
     )
     if interaction.guild and interaction.guild.icon:
         embed.set_author(name=interaction.guild.name, icon_url=str(interaction.guild.icon.url))
@@ -395,61 +460,70 @@ async def about_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="enable_guard", description="Open the Guardian control panel (admin only)")
-async def enable_guard(interaction: discord.Interaction):
-    if not admin_check(interaction):
-        await interaction.response.send_message("Administrator permissions required.", ephemeral=True)
+@tree.command(name="enable_guard", description="Deploy Guardian control panel in this channel (admin only)")
+async def cmd_enable_guard(interaction: discord.Interaction):
+    # defer quickly to avoid interaction expiration if something heavy happens
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin(interaction):
+        await interaction.followup.send("Administrator permissions required.", ephemeral=True)
         return
     guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("Use this command in a server.", ephemeral=True)
-        return
-    ensure_guild(guild.id)
-    await save_db()
-    embed = build_guard_embed(guild, _db[str(guild.id)])
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    _db[sid]["guard_enabled"] = True
+    # send persistent panel message in current channel
+    embed = build_guard_embed(guild, _db[sid])
     view = build_guard_view(guild.id)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    try:
+        panel_msg = await interaction.channel.send(embed=embed, view=view)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to deploy panel: {e}", ephemeral=True)
+        return
+    _db[sid]["panel_message"] = store_panel_loc(panel_msg.channel.id, panel_msg.id)
+    await save_config()
+    await interaction.followup.send("Guardian panel deployed in this channel (persistent).", ephemeral=True)
 
 
-@tree.command(name="disable_guard", description="Disable Guardian protections for this server (admin only)")
-async def disable_guard(interaction: discord.Interaction):
-    if not admin_check(interaction):
-        await interaction.response.send_message("Administrator permissions required.", ephemeral=True)
+@tree.command(name="disable_guard", description="Disable Guardian protections (admin only)")
+async def cmd_disable_guard(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin(interaction):
+        await interaction.followup.send("Administrator permissions required.", ephemeral=True)
         return
     guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("Use in server.", ephemeral=True)
-        return
-    ensure_guild(guild.id)
-    _db[str(guild.id)]["guard_enabled"] = False
-    await save_db()
-    await interaction.response.send_message("Guardian guard disabled for this server.", ephemeral=True)
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    _db[sid]["guard_enabled"] = False
+    _db[sid]["panel_message"] = None
+    await save_config()
+    await interaction.followup.send("Guardian disabled for this server.", ephemeral=True)
 
 
 @tree.command(name="set_log_channel", description="Set a channel for Guardian logs (admin only)")
-async def set_log_channel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
-    if not admin_check(interaction):
-        await interaction.response.send_message("Administrator permissions required.", ephemeral=True)
+async def cmd_set_log_channel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin(interaction):
+        await interaction.followup.send("Administrator permissions required.", ephemeral=True)
         return
     guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("Use in server.", ephemeral=True)
-        return
-    ensure_guild(guild.id)
-    _db[str(guild.id)]["log_channel_id"] = channel.id if channel else None
-    await save_db()
-    await interaction.response.send_message(f"Log channel updated to {channel.mention if channel else 'None'}.", ephemeral=True)
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    _db[sid]["log_channel_id"] = channel.id if channel else None
+    await save_config()
+    await interaction.followup.send(f"Log channel set to {channel.mention if channel else 'None'}.", ephemeral=True)
 
 
-### ---------------- CORE PUNISH + HANDLERS ---------------- ###
+# ---------------- PUNISHMENT ENGINE ----------------
 async def perform_punishments(guild: discord.Guild, actor: Optional[discord.Member], category: str, target: Optional[Any], settings: Dict[str, Any]):
     if not settings.get("guard_enabled", False):
         return
-    if not rate_limit_allows(settings, f"{category}:{actor.id if actor else 'anon'}", window_seconds=10, limit=2):
-        return
     ant = settings.get("antinuke", {})
     actions = ant.get("actions", {})
-    embed = discord.Embed(title="Guardian — Antinuke Trigger", color=discord.Color.red(), timestamp=datetime.datetime.utcnow())
+    # rate-limit triggers
+    key = f"{category}:{actor.id if actor else 'anon'}"
+    if not rate_limit_allows(settings, key, window_seconds=10, limit=2):
+        return
+    embed = discord.Embed(title="Guardian — Antinuke Trigger", color=discord.Color.red(), timestamp=utc_now())
     embed.add_field(name="Trigger", value=category, inline=False)
     if actor:
         embed.add_field(name="Actor", value=f"{actor} ({actor.id})", inline=True)
@@ -470,7 +544,7 @@ async def perform_punishments(guild: discord.Guild, actor: Optional[discord.Memb
                     embed.add_field(name="Remove roles", value=f"Removed {len(roles)} roles", inline=False)
         except Exception as e:
             embed.add_field(name="Remove roles failed", value=str(e), inline=False)
-    # kick
+    # kick_member
     if actions.get("kick_member", False) and isinstance(actor, discord.Member):
         try:
             if actor == guild.owner:
@@ -480,7 +554,7 @@ async def perform_punishments(guild: discord.Guild, actor: Optional[discord.Memb
                 embed.add_field(name="Kick", value="Actor kicked", inline=False)
         except Exception as e:
             embed.add_field(name="Kick failed", value=str(e), inline=False)
-    # ban
+    # ban_member
     if actions.get("ban_member", False) and isinstance(actor, discord.Member):
         try:
             if actor == guild.owner:
@@ -490,7 +564,7 @@ async def perform_punishments(guild: discord.Guild, actor: Optional[discord.Memb
                 embed.add_field(name="Ban", value="Actor banned", inline=False)
         except Exception as e:
             embed.add_field(name="Ban failed", value=str(e), inline=False)
-    # server lockdown
+    # server_lockdown
     if actions.get("server_lockdown", False):
         count = 0
         if guild.me.guild_permissions.manage_channels:
@@ -504,26 +578,27 @@ async def perform_punishments(guild: discord.Guild, actor: Optional[discord.Memb
                     continue
             embed.add_field(name="Server lockdown", value=f"Locked {count} channels (where permitted)", inline=False)
         else:
-            embed.add_field(name="Server lockdown", value="Bot lacks Manage Channels permission", inline=False)
-    # unverified ban
+            embed.add_field(name="Server lockdown", value="Missing Manage Channels permission", inline=False)
+    # unverified_ban
     if actions.get("unverified_ban", False) and isinstance(actor, discord.Member):
         try:
-            age_days = (datetime.datetime.utcnow() - actor.created_at).days
+            age_days = (utc_now() - actor.created_at).days
             if age_days < 7 and guild.me.guild_permissions.ban_members:
                 await guild.ban(actor, reason="Guardian unverified_ban", delete_message_days=1)
                 embed.add_field(name="Unverified ban", value=f"Banned actor (age {age_days}d)", inline=False)
         except Exception as e:
             embed.add_field(name="Unverified ban failed", value=str(e), inline=False)
-    # notify_admins will be included in embed posting
+    # Send log embed to log channel or admins
     await send_log_embed(guild, embed, settings)
 
 
-# events
+# ---------------- EVENT HANDLERS ----------------
 @bot.event
-async def on_guild_channel_delete(channel):
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     guild = channel.guild
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False) or not settings.get("antinuke", {}).get("channels_deleted", False):
         return
     actor = await fetch_audit_actor(guild, discord.AuditLogAction.channel_delete)
@@ -533,10 +608,11 @@ async def on_guild_channel_delete(channel):
 
 
 @bot.event
-async def on_guild_channel_create(channel):
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
     guild = channel.guild
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False) or not settings.get("antinuke", {}).get("channels_created", False):
         return
     actor = await fetch_audit_actor(guild, discord.AuditLogAction.channel_create)
@@ -546,10 +622,11 @@ async def on_guild_channel_create(channel):
 
 
 @bot.event
-async def on_guild_role_delete(role):
+async def on_guild_role_delete(role: discord.Role):
     guild = role.guild
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False) or not settings.get("antinuke", {}).get("roles_deleted", False):
         return
     actor = await fetch_audit_actor(guild, discord.AuditLogAction.role_delete)
@@ -559,10 +636,11 @@ async def on_guild_role_delete(role):
 
 
 @bot.event
-async def on_guild_role_create(role):
+async def on_guild_role_create(role: discord.Role):
     guild = role.guild
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False) or not settings.get("antinuke", {}).get("roles_created", False):
         return
     actor = await fetch_audit_actor(guild, discord.AuditLogAction.role_create)
@@ -572,10 +650,11 @@ async def on_guild_role_create(role):
 
 
 @bot.event
-async def on_webhooks_update(channel):
+async def on_webhooks_update(channel: discord.abc.GuildChannel):
     guild = channel.guild
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False) or not settings.get("antinuke", {}).get("webhooks_created", False):
         return
     actor = await fetch_audit_actor(guild, discord.AuditLogAction.webhook_create)
@@ -586,8 +665,9 @@ async def on_webhooks_update(channel):
 
 @bot.event
 async def on_member_ban(guild: discord.Guild, user: discord.User):
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False) or not settings.get("antinuke", {}).get("member_bans", False):
         return
     actor = await fetch_audit_actor(guild, discord.AuditLogAction.ban, target_id=user.id)
@@ -599,8 +679,9 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 @bot.event
 async def on_member_remove(member: discord.Member):
     guild = member.guild
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False) or not settings.get("antinuke", {}).get("member_kicks", False):
         return
     actor = await fetch_audit_actor(guild, discord.AuditLogAction.kick, target_id=member.id)
@@ -613,11 +694,12 @@ async def on_member_remove(member: discord.Member):
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False):
         return
-    # bots added detection
+    # detect bots added
     if member.bot and settings.get("antinuke", {}).get("bots_added", False):
         actor = await fetch_audit_actor(guild, discord.AuditLogAction.bot_add, target_id=member.id)
         if actor and isinstance(actor, discord.Member) and is_whitelisted(settings, "antinuke", actor):
@@ -630,78 +712,94 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
     guild = message.guild
-    ensure_guild(guild.id)
-    settings = _db[str(guild.id)]
+    ensure_guild_data(guild.id)
+    sid = str(guild.id)
+    settings = _db[sid]
     if not settings.get("guard_enabled", False):
         return
     author = message.author
+    # automod whitelist skip
     if is_whitelisted(settings, "automod", author):
         await bot.process_commands(message)
         return
-
-    automod = settings.get("automod", {})
+    am = settings.get("automod", {})
     # link/invite filter
-    if automod.get("link_invite_filter", False):
+    if am.get("link_invite_filter", False):
         content = message.content.lower()
         if "discord.gg/" in content or "discord.com/invite" in content or "http://" in content or "https://" in content:
             try:
                 await message.delete()
             except Exception:
                 pass
-            embed = discord.Embed(title="Guardian — AutoMod Link Blocked", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
+            embed = discord.Embed(title="Guardian — AutoMod Link Blocked", color=discord.Color.orange(), timestamp=utc_now())
             embed.add_field(name="User", value=f"{author} ({author.id})", inline=True)
             embed.add_field(name="Channel", value=message.channel.mention, inline=True)
             embed.add_field(name="Content", value=(message.content[:1024] or "(empty)"), inline=False)
             await send_log_embed(guild, embed, settings)
             return
-
     # mass mention protection
-    if automod.get("mass_mention_protection", False):
-        thr = int(automod.get("mass_mention_threshold", 5))
+    if am.get("mass_mention_protection", False):
+        thr = int(am.get("mass_mention_threshold", 5))
         if len(message.mentions) >= thr:
             try:
                 await message.delete()
             except Exception:
                 pass
-            embed = discord.Embed(title="Guardian — AutoMod Mass Mention", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
+            embed = discord.Embed(title="Guardian — AutoMod Mass Mention", color=discord.Color.orange(), timestamp=utc_now())
             embed.add_field(name="User", value=f"{author} ({author.id})", inline=True)
             embed.add_field(name="Channel", value=message.channel.mention, inline=True)
-            embed.add_field(name="Mentions Count", value=str(len(message.mentions)), inline=False)
+            embed.add_field(name="Mentions", value=str(len(message.mentions)), inline=False)
             await send_log_embed(guild, embed, settings)
             return
-
     await bot.process_commands(message)
 
 
-### ---------------- KEEP-ALIVE (Flask) ---------------- ###
+# ---------------- KEEP-ALIVE (Flask) ----------------
 app = Flask("guardian-keepalive")
 
-@app.route("/")
-def home():
-    return jsonify({"status": "ok", "timestamp": datetime.datetime.utcnow().isoformat()})
 
-def run_flask():
-    # recommended for Render: use 0.0.0.0 and port from env
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "ok", "ts": utc_now().isoformat()})
+
+
+def run_flask() -> None:
     host = "0.0.0.0"
     port = KEEP_ALIVE_PORT
+    # debug False, threaded True is fine for tiny keep-alive
     app.run(host=host, port=port, threaded=True)
 
-### ---------------- STARTUP ---------------- ###
+
+# ---------------- STARTUP ----------------
 @bot.event
 async def on_ready():
-    # load DB on start
-    await load_db()
-    print(f"Logged in as {bot.user} (id: {bot.user.id}) — connected to {len(bot.guilds)} guilds")
+    await load_config()
+    print(f"Logged in as {bot.user} ({bot.user.id}) — guilds: {len(bot.guilds)}")
+    # sync commands
     try:
         await tree.sync()
         print("Slash commands synced.")
     except Exception as e:
-        print("Failed to sync slash commands:", e)
+        print("Failed to sync commands:", e)
+    # refresh any existing panels (best-effort)
+    for gid, settings in list(_db.items()):
+        if settings.get("panel_message"):
+            loc = parse_panel_loc(settings["panel_message"])
+            if not loc:
+                continue
+            ch_id, msg_id = loc
+            guild = bot.get_guild(int(gid))
+            if guild:
+                try:
+                    await refresh_panel_message(guild, gid)
+                except Exception:
+                    pass
+
 
 if __name__ == "__main__":
-    # start keep-alive server in background thread
+    # start keep-alive server (background)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    # load DB and run bot
-    asyncio.run(load_db())
+    # load config before running bot
+    asyncio.run(load_config())
     bot.run(TOKEN)
